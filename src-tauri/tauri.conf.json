@@ -24,6 +24,21 @@
         "resizable": false,
         "dragDropEnabled": true,
         "visible": true
+      },
+      {
+        "label": "utility-popup",
+        "title": "Edge Mochi",
+        "width": 400,
+        "height": 500,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "dragDropEnabled": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

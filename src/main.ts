@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Tracked } from "./anim";
+import { PetMotionEngine, type PetState } from "./pet-motion";
 
 type Shortcut = { id: string; name: string; glyph: string; targets: string[]; action?: "focus"; custom?: boolean };
 type PocketItem = { id: string; name: string; kind: "file" | "image" | "text"; value: string; addedAt: number; truncated?: boolean };
@@ -13,7 +14,8 @@ type FocusState = { durationMs: number; remainingMs: number; endsAt: number; run
 type MediaInfo = { title: string; artist: string; playing: boolean };
 type Edge = "left" | "top" | "bottom";
 type MenuTab = "home" | "pet" | "shortcuts";
-type PetPanel = "pocket" | "customize";
+type UtilityPopupMode = "focus" | "pocket" | "customize" | "clipboard";
+type UtilityPopupPosition = { x: number; y: number };
 type DisplayInfo = {
   id: string;
   name: string;
@@ -33,6 +35,7 @@ type LayoutUpdate = {
   activeLabel: string;
   expanded: boolean;
 };
+type CodexHookEvent = { eventName: string; occurredAt: number; toolName: string | null; agentType: string | null };
 
 const DEFAULT_SHORTCUTS: Shortcut[] = [
   { id: "terminal", name: "Terminal", glyph: "⌘", targets: ["wt.exe"] },
@@ -61,6 +64,8 @@ const KEYS = {
   petSkin: "edge-mochi.pet-skin",
   petAccessory: "edge-mochi.pet-accessory",
   focus: "edge-mochi.focus",
+  utilityPopup: "edge-mochi.utility-popup",
+  utilityPopupPosition: "edge-mochi.utility-popup-position",
 };
 const DEFAULTS = {
   length: 80,
@@ -104,7 +109,10 @@ let volume = 62;
 let expanded = false;
 let settingsOpen = false;
 let activeTab: MenuTab = "home";
-let petPanel: PetPanel | null = null;
+let utilityPopupMode: UtilityPopupMode | null = null;
+let utilityPopupBlurTimer: number | undefined;
+let utilityPopupPositionSaveTimer: number | undefined;
+let latestUtilityPopupPosition: UtilityPopupPosition | null = null;
 let barLength = readNumber(KEYS.length, DEFAULTS.length, MIN_LENGTH, MAX_LENGTH, LENGTH_STEP);
 let barThickness = readNumber(KEYS.thickness, DEFAULTS.thickness, MIN_THICKNESS, MAX_THICKNESS);
 let edge = readEdge();
@@ -121,9 +129,15 @@ let petSkin: PetSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight"], 
 let petAccessory: PetAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
 let focusState = readFocusState();
 let mediaInfo: MediaInfo = { title: "", artist: "", playing: false };
+let codexHooksEnabled = false;
+let codexHooksBusy = true;
+let codexHooksStatusMessage = "Verificando a configuração do Codex…";
+let codexPollPending = false;
+let latestCodexPetState: { state: PetState; detail: string; occurredAt: number } | null = null;
 let petMoodOverride = "";
 let petMoodUntil = 0;
 let pocketDropActive = false;
+let nativeDragScale = 1;
 let pocketNotice = "Solte arquivos ou texto para guardar";
 let petDropFeedback = "";
 let petDropFeedbackTimer: number | undefined;
@@ -131,12 +145,10 @@ let clipboardNotice = "";
 let pendingPocketValues = new Set<string>();
 let hoverCloseTimer: number | undefined;
 let geometryFrame = 0;
-let petPokes = 0;
-let petPokeReset: number | undefined;
 let petLoveTimer: number | undefined;
-let petModeTimer: number | undefined;
 let lastPetLove = 0;
 let hasGreetedPet = false;
+const petMotionEngines = new WeakMap<HTMLElement, PetMotionEngine>();
 let geometryMotion: {
   body: HTMLElement;
   width: Tracked;
@@ -249,6 +261,7 @@ function updatePetAtmosphere() {
     pet.dataset.skin = petSkin;
     pet.dataset.accessory = petAccessory;
     pet.dataset.mood = mood;
+    petMotionEngines.get(pet)?.setAppearance(petSkin, petAccessory, mood);
   });
   app.querySelectorAll<HTMLElement>(".pet-mood-label, .home-pet-copy small").forEach((label) => {
     label.textContent = petMoodLabel(mood);
@@ -433,21 +446,48 @@ function makeId() {
   return typeof crypto.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+type MenuIconName = "brand" | "home" | "pet" | "shortcuts" | "settings" | "close" | "pocket" | "clipboard" | "search" | "chevron" | "back" | "refresh" | "volume" | "previous" | "play" | "pause" | "next" | "plus" | "file" | "image" | "text";
+
+function menuIcon(name: MenuIconName) {
+  const paths: Record<MenuIconName, string> = {
+    brand: '<path d="M12 2.7 13.7 9l6.3 3-6.3 3-1.7 6.3L10.3 15 4 12l6.3-3L12 2.7Z"/><path d="M19 3v4M17 5h4M4 17v4M2 19h4"/>',
+    home: '<path d="m3.5 10 8.5-7 8.5 7v9a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1v-9Z"/><path d="M9 20v-6h6v6"/>',
+    pet: '<circle cx="12" cy="12" r="9"/><circle cx="9" cy="11" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="11" r="1" fill="currentColor" stroke="none"/>',
+    shortcuts: '<rect x="4" y="4" width="6" height="6" rx="1.4"/><rect x="14" y="4" width="6" height="6" rx="1.4"/><rect x="4" y="14" width="6" height="6" rx="1.4"/><rect x="14" y="14" width="6" height="6" rx="1.4"/>',
+    settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+    close: '<path d="m18 6-12 12M6 6l12 12"/>',
+    pocket: '<path d="M3 7.5h7l2 2h9v8.7a1.8 1.8 0 0 1-1.8 1.8H4.8A1.8 1.8 0 0 1 3 18.2V7.5Z"/><path d="M3 10h18"/>',
+    clipboard: '<rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4.5V3h6v1.5M9 9h6M9 13h6M9 17h3"/>',
+    search: '<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/>',
+    chevron: '<path d="m9 18 6-6-6-6"/>',
+    back: '<path d="m15 18-6-6 6-6"/>',
+    refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.6 9A7 7 0 0 1 18 6.8L20 12M4 12l2 5.2A7 7 0 0 0 18.4 15"/>',
+    volume: '<path d="M4 10v4h4l5 4V6l-5 4H4Z"/><path d="M17 9a5 5 0 0 1 0 6M19 6a9 9 0 0 1 0 12"/>',
+    previous: '<path d="M6 5v14M19 6l-9 6 9 6V6Z"/>',
+    play: '<path d="m8 5 11 7-11 7V5Z"/>',
+    pause: '<path d="M8 5v14M16 5v14"/>',
+    next: '<path d="M18 5v14M5 6l9 6-9 6V6Z"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    file: '<path d="M6 3h8l4 4v14H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/><path d="M14 3v5h5M8 13h8M8 17h8"/>',
+    image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m21 16-5-5L5 20"/>',
+    text: '<path d="M5 5h14M5 10h14M5 15h9M5 20h12"/>',
+  };
+  return `<svg class="menu-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths[name]}</svg>`;
+}
+
 function renderPetCharacter(className = "") {
   return `
     <button class="pet ${className}" data-skin="${petSkin}" data-accessory="${petAccessory}" data-mood="${getPetMood()}" type="button" aria-label="${escapeHtml(petName)}">
-      <span class="pet-ear left"></span><span class="pet-ear right"></span>
-      <span class="pet-face" aria-hidden="true"><i></i><i></i></span>
-      <span class="pet-paw" aria-hidden="true"></span>
-      <span class="pet-accessory" aria-hidden="true"></span>
+      <canvas class="pet-canvas" aria-hidden="true"></canvas>
+      <span class="pet-activity-tooltip" role="status" aria-live="polite" aria-hidden="true"></span>
     </button>`;
 }
 
 function renderPocketItems(limit = 8) {
-  if (pocketItems.length === 0) return `<div class="pocket-empty"><span>◌</span><small>${escapeHtml(pocketNotice)}</small></div>`;
-  return pocketItems.slice(0, limit).map((item) => `
-    <article class="pocket-item" data-pocket-kind="${item.kind}">
-      <span class="pocket-item-icon">${item.kind === "image" ? "▧" : item.kind === "text" ? "¶" : "▤"}</span>
+ if (pocketItems.length === 0) return `<div class="pocket-empty"><span>${menuIcon("pocket")}</span><small>${escapeHtml(pocketNotice)}</small></div>`;
+ return pocketItems.slice(0, limit).map((item) => `
+   <article class="pocket-item" data-pocket-kind="${item.kind}">
+      <span class="pocket-item-icon">${menuIcon(item.kind === "image" ? "image" : item.kind === "text" ? "text" : "file")}</span>
       <span class="pocket-item-copy"><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><small>${item.kind === "text" ? item.truncated ? "primeiros 50 mil caracteres" : "texto guardado" : "o original continua no lugar"}</small></span>
       <button class="mini-icon" data-action="open-pocket" data-pocket-id="${escapeHtml(item.id)}" aria-label="Abrir ${escapeHtml(item.name)}" title="Abrir">↗</button>
       <button class="mini-icon" data-action="remove-pocket" data-pocket-id="${escapeHtml(item.id)}" aria-label="Tirar ${escapeHtml(item.name)} do bolso" title="Tirar do bolso">×</button>
@@ -465,10 +505,10 @@ function renderClipboardEntries(limit = 4) {
     </div>`).join("");
 }
 
-function renderLauncherItems() {
+function renderLauncherItems(quickLimit?: number) {
   const items = [...LAUNCHER_DEFAULTS, ...shortcuts.filter((shortcut) => !shortcut.action)];
-  return items.map((item) => `
-    <button class="launch-item" data-action="launch-item" data-launch-id="${escapeHtml(item.id)}" data-launch-name="${escapeHtml(item.name.toLowerCase())}">
+  return items.map((item, index) => `
+    <button class="launch-item ${quickLimit !== undefined && index >= quickLimit ? "home-launch-extra" : ""}" data-action="launch-item" data-launch-id="${escapeHtml(item.id)}" data-launch-name="${escapeHtml(item.name.toLowerCase())}">
       <span>${escapeHtml(item.glyph)}</span><small>${escapeHtml(item.name)}</small>
     </button>`).join("");
 }
@@ -478,73 +518,43 @@ function formatDuration(ms: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function renderFocusTile() {
-  const remaining = focusRemainingMs();
-  const progress = focusState.durationMs > 0 ? 100 - remaining / focusState.durationMs * 100 : 0;
-  return `
-    <section class="home-tile home-focus">
-      <div class="tile-heading"><span>Foco</span><span class="focus-countdown" id="focus-countdown">${formatDuration(remaining)}</span></div>
-      <div class="focus-progress"><i id="focus-progress" style="--progress:${progress}%"></i></div>
-      <small class="focus-status" id="focus-status"></small>
-      <div class="focus-controls"><label class="duration-control"><input id="focus-minutes" type="number" min="1" max="180" value="${Math.max(1, Math.round(focusState.durationMs / 60_000))}" ${focusState.running ? "disabled" : ""} aria-label="Duração do foco em minutos" /> min</label><button class="tile-action" data-action="focus-toggle">${focusState.running ? "Pausar" : remaining === 0 ? "Recomeçar" : "Iniciar"}</button><button class="tile-action quiet" data-action="focus-reset" aria-label="Reiniciar temporizador" title="Reiniciar">↺</button></div>
-    </section>`;
+function renderHomeShortcutItems(limit = 3) {
+  return shortcuts.slice(0, limit).map((shortcut) => `
+    <button class="home-shortcut" data-action="run-shortcut" data-shortcut-id="${escapeHtml(shortcut.id)}" title="${escapeHtml(shortcut.name)}">
+      <span class="home-shortcut-icon">${escapeHtml(shortcut.glyph)}</span><span class="home-shortcut-name">${escapeHtml(shortcut.name)}</span>
+    </button>`).join("");
 }
 
 function renderHomePage() {
   return `
     <div class="home-grid">
-      <section class="home-tile home-volume">
-        <div class="tile-heading"><span>Volume</span><output id="volume-value">${volume}%</output></div>
-        <input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume do sistema" />
-        <div class="range-labels"><span>silencioso</span><span>alto</span></div>
-      </section>
-      <section class="home-tile home-media">
-        <div class="tile-heading"><span>Agora tocando</span><button class="tile-link" data-action="refresh-media">atualizar</button></div>
-        <div class="media-copy"><strong class="media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong><small class="media-artist">${escapeHtml(mediaInfo.artist || "Se a música estiver tocando, use os controles")}</small></div>
-        <div class="media-controls"><button data-action="media-previous" aria-label="Faixa anterior" title="Anterior">|◀</button><button class="media-play" data-action="media-toggle" aria-label="Reproduzir ou pausar" title="Reproduzir ou pausar">${mediaInfo.playing ? "Ⅱ" : "▶"}</button><button data-action="media-next" aria-label="Próxima faixa" title="Próxima">▶|</button></div>
-      </section>
-      ${renderFocusTile()}
-      <section class="home-tile home-launcher">
-        <div class="tile-heading"><span>Abre rapidinho</span><button class="tile-link" data-tab="shortcuts">todos</button></div>
-        <input class="launcher-search" data-launcher-search placeholder="App, pasta ou site…" aria-label="Buscar aplicativo, pasta ou site" />
-        <div class="launcher-items">${renderLauncherItems()}</div>
-      </section>
-      <section class="home-tile home-pocket">
-        <div class="tile-heading"><span>Bolso do ${escapeHtml(petName)}</span><span class="item-count">${pocketItems.length}/8</span></div>
-        <div class="pocket-preview">${renderPocketItems(2)}</div>
-        <small class="pocket-status">${escapeHtml(pocketNotice)}</small>
-        <button class="tile-link pocket-add-clipboard" data-action="pocket-clipboard">guardar texto copiado</button>
-      </section>
-      <section class="home-tile home-clipboard">
-        <div class="tile-heading"><span>Prancheta</span><button class="tile-link" data-action="clipboard-capture">capturar</button></div>
-        <div class="clipboard-list">${renderClipboardEntries(3)}</div>
-        <small class="clipboard-status">${escapeHtml(clipboardNotice)}</small>
-      </section>
-      <section class="home-tile home-pet-summary">
-        <div class="home-pet-row">${renderPetCharacter("pet-home")}<div class="home-pet-copy"><strong>${escapeHtml(petName)}</strong><small>${escapeHtml(petMoodLabel())}</small></div><button class="tile-link" data-tab="pet">ver</button></div>
+      <section class="home-context-card">
+        <div class="home-message">
+          ${renderPetCharacter("pet-home")}
+          <div class="home-message-copy">
+            <span class="section-kicker">EDGE MOCHI</span>
+            <strong>Tudo tranquilo por aqui.</strong>
+            <small>Música, volume e atalhos sempre à mão.</small>
+          </div>
+        </div>
+        <section class="quick-audio">
+          <span class="section-kicker home-audio-label">TOCANDO AGORA</span>
+          <div class="audio-now">
+            <div class="media-copy"><strong class="media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong><small class="media-artist">${escapeHtml(mediaInfo.artist || "Quando algo tocar, aparece aqui")}</small></div>
+            <div class="media-controls">
+              <button data-action="media-previous" aria-label="Faixa anterior" title="Anterior">${menuIcon("previous")}</button>
+              <button class="media-play" data-action="media-toggle" aria-label="Reproduzir ou pausar" title="Reproduzir ou pausar"><span class="media-play-icon">${menuIcon(mediaInfo.playing ? "pause" : "play")}</span></button>
+              <button data-action="media-next" aria-label="Próxima faixa" title="Próxima">${menuIcon("next")}</button>
+            </div>
+          </div>
+          <label class="volume-control"><span class="volume-icon">${menuIcon("volume")}</span><span class="volume-label">Volume</span><input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume do sistema" /><output id="volume-value">${volume}%</output></label>
+        </section>
+        <section class="home-shortcuts">
+          <span class="section-kicker">ATALHOS</span>
+          <div class="home-shortcut-items">${renderHomeShortcutItems(3)}</div>
+        </section>
       </section>
     </div>`;
-}
-
-function renderPetPanel() {
-  if (!petPanel) return "";
-  const title = petPanel === "pocket" ? `Bolso do ${escapeHtml(petName)}` : "Personalizar o Mochi";
-  const content = petPanel === "pocket"
-    ? `
-      <div class="pocket-dropzone ${pocketDropActive ? "is-dragging" : ""}" data-dropzone="pocket"><span>↓</span><strong>${pocketDropActive ? "Pode soltar, eu pego!" : "Solte um arquivo ou texto no Mochi"}</strong><small>O original continua no lugar.</small></div>
-      <small class="pocket-status">${escapeHtml(pocketNotice)}</small>
-      <div class="pocket-items">${renderPocketItems()}</div>
-      <button class="secondary-action" data-action="pocket-clipboard">＋ guardar o texto copiado</button>`
-    : `
-      <form class="pet-name-form" data-action="pet-name-form"><input name="pet-name" value="${escapeHtml(petName)}" maxlength="24" aria-label="Nome do pet" /><button class="secondary-action">Salvar nome</button></form>
-      <label class="custom-label" for="pet-skin">Aparência</label><select id="pet-skin"><option value="pearl" ${petSkin === "pearl" ? "selected" : ""}>Pérola</option><option value="smoke" ${petSkin === "smoke" ? "selected" : ""}>Fumaça</option><option value="midnight" ${petSkin === "midnight" ? "selected" : ""}>Meia-noite</option></select>
-      <label class="custom-label" for="pet-accessory">Acessório</label><select id="pet-accessory"><option value="none" ${petAccessory === "none" ? "selected" : ""}>Sem acessório</option><option value="star" ${petAccessory === "star" ? "selected" : ""}>Estrelinha</option><option value="bow" ${petAccessory === "bow" ? "selected" : ""}>Laço</option></select>`;
-  return `
-    <button class="pet-panel-backdrop" data-action="pet-panel-close" aria-label="Fechar painel"></button>
-    <aside class="pet-panel ${petPanel === "pocket" ? "pet-pocket-card" : "pet-customize"}" aria-label="${title}">
-      <header class="pet-panel-heading"><strong>${title}</strong><button class="pet-tool" data-action="pet-panel-close" aria-label="Fechar">×</button></header>
-      ${content}
-    </aside>`;
 }
 
 function renderPetPage() {
@@ -556,13 +566,211 @@ function renderPetPage() {
         ${renderPetCharacter("pet-large")}
         <span class="pet-name">${escapeHtml(petName)}</span>
         <strong class="pet-drop-prompt" aria-live="polite">${pocketDropActive ? "Pode soltar, eu pego!" : escapeHtml(petDropFeedback)}</strong>
-        <div class="pet-tools" aria-label="Ações do Mochi">
-          <button class="pet-tool" data-action="pet-panel-open" data-panel="pocket" aria-label="Abrir bolso do Mochi" title="Bolso">▤</button>
-          <button class="pet-tool" data-action="pet-panel-open" data-panel="customize" aria-label="Personalizar Mochi" title="Personalizar">⚙</button>
+     <div class="pet-tools" aria-label="Ações do Mochi">
+          <button class="pet-tool" data-action="open-utility-popup" data-popup="pocket" aria-label="Abrir bolso do Mochi" title="Bolso">${menuIcon("pocket")}</button>
+          <button class="pet-tool" data-action="open-utility-popup" data-popup="customize" aria-label="Personalizar Mochi" title="Personalizar">${menuIcon("settings")}</button>
         </div>
       </div>
-      ${renderPetPanel()}
     </div>`;
+}
+
+function readUtilityPopupMode(): UtilityPopupMode | null {
+  const mode = localStorage.getItem(KEYS.utilityPopup);
+  return mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard" ? mode : null;
+}
+
+function readUtilityPopupPosition(): UtilityPopupPosition | null {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(KEYS.utilityPopupPosition) ?? "null");
+    if (typeof value !== "object" || value === null) return null;
+    const position = value as Partial<UtilityPopupPosition>;
+    if (typeof position.x !== "number" || !Number.isFinite(position.x)
+      || typeof position.y !== "number" || !Number.isFinite(position.y)) return null;
+    return { x: Math.round(position.x), y: Math.round(position.y) };
+  } catch {
+    return null;
+  }
+}
+
+function flushUtilityPopupPosition() {
+  if (utilityPopupPositionSaveTimer !== undefined) {
+    window.clearTimeout(utilityPopupPositionSaveTimer);
+    utilityPopupPositionSaveTimer = undefined;
+  }
+  if (latestUtilityPopupPosition) {
+    localStorage.setItem(KEYS.utilityPopupPosition, JSON.stringify(latestUtilityPopupPosition));
+  }
+}
+
+function renderUtilityPopupContent(mode: UtilityPopupMode) {
+  if (mode === "focus") {
+    const remaining = focusRemainingMs();
+    const progress = focusState.durationMs > 0 ? 100 - remaining / focusState.durationMs * 100 : 0;
+    return `
+      <section class="utility-focus">
+        <div class="utility-focus-intro"><span class="section-kicker">TEMPO DE FOCO</span><strong>Um passo de cada vez.</strong><small>O Mochi acompanha seu ciclo com você.</small></div>
+        <div class="utility-focus-clock" id="focus-countdown">${formatDuration(remaining)}</div>
+        <div class="focus-progress utility-focus-progress"><i id="focus-progress" style="--progress:${progress}%"></i></div>
+        <div class="utility-focus-controls">
+          <label class="utility-focus-duration"><input id="focus-minutes" type="number" min="1" max="180" value="${Math.max(1, Math.round(focusState.durationMs / 60_000))}" ${focusState.running ? "disabled" : ""} aria-label="Duração do foco em minutos" /> minutos</label>
+          <div><button class="utility-primary-action" data-action="focus-toggle">${focusState.running ? "Pausar" : remaining === 0 ? "Recomeçar" : "Iniciar foco"}</button><button class="utility-secondary-action" data-action="focus-reset" aria-label="Reiniciar temporizador" title="Reiniciar">↺</button></div>
+        </div>
+        <small class="focus-status utility-focus-status" id="focus-status"></small>
+      </section>`;
+  }
+  if (mode === "pocket") {
+    return `
+      <section class="utility-pocket">
+        <div class="pocket-dropzone ${pocketDropActive ? "is-dragging" : ""}" data-dropzone="pocket"><span>↓</span><strong>${pocketDropActive ? "Pode soltar, eu pego!" : "Solte um arquivo ou texto"}</strong><small>O original continua no lugar.</small></div>
+        <small class="pocket-status">${escapeHtml(pocketNotice)}</small>
+        <div class="pocket-items">${renderPocketItems()}</div>
+        <button class="secondary-action" data-action="pocket-clipboard">${menuIcon("plus")} Guardar texto copiado</button>
+      </section>`;
+  }
+  if (mode === "customize") {
+    return `
+      <section class="utility-customize">
+        <form class="pet-name-form" data-action="pet-name-form"><input name="pet-name" value="${escapeHtml(petName)}" maxlength="24" aria-label="Nome do pet" /><button class="secondary-action">Salvar nome</button></form>
+        <label class="custom-label" for="pet-skin">Aparência</label>
+        <select id="pet-skin"><option value="pearl" ${petSkin === "pearl" ? "selected" : ""}>Pérola</option><option value="smoke" ${petSkin === "smoke" ? "selected" : ""}>Fumaça</option><option value="midnight" ${petSkin === "midnight" ? "selected" : ""}>Meia-noite</option></select>
+        <label class="custom-label" for="pet-accessory">Acessório</label>
+        <select id="pet-accessory"><option value="none" ${petAccessory === "none" ? "selected" : ""}>Sem acessório</option><option value="star" ${petAccessory === "star" ? "selected" : ""}>Estrelinha</option><option value="bow" ${petAccessory === "bow" ? "selected" : ""}>Laço</option></select>
+      </section>`;
+  }
+  return `
+    <section class="utility-clipboard">
+      <div class="clipboard-list">${renderClipboardEntries(12)}</div>
+      <small class="clipboard-status">${escapeHtml(clipboardNotice)}</small>
+      <button class="secondary-action clipboard-capture" data-action="clipboard-capture">${menuIcon("plus")} Capturar texto</button>
+    </section>`;
+}
+
+function renderUtilityPopup() {
+  utilityPopupMode = readUtilityPopupMode();
+  if (!utilityPopupMode) {
+    app.innerHTML = "";
+    return;
+  }
+  const copy: Record<UtilityPopupMode, { title: string; subtitle: string }> = {
+    focus: { title: "Foco", subtitle: "Seu tempo, no seu ritmo" },
+    pocket: { title: `Bolso do ${petName}`, subtitle: `${pocketItems.length}/8 itens · os originais ficam no lugar` },
+    customize: { title: "Personalizar o Mochi", subtitle: "Nome, aparência e acessório" },
+    clipboard: { title: "Prancheta", subtitle: `${clipboardEntries.length} itens recentes` },
+  };
+  const heading = copy[utilityPopupMode];
+  app.innerHTML = `
+    <main class="utility-popup-window" data-popup="${utilityPopupMode}">
+      <section class="utility-popup-card">
+        <header class="utility-popup-header">
+          <div class="utility-popup-drag-handle"><span class="section-kicker">EDGE MOCHI</span><strong>${escapeHtml(heading.title)}</strong><small data-popup-subtitle>${escapeHtml(heading.subtitle)}</small></div>
+          <button class="utility-popup-close" data-action="popup-close" aria-label="Fechar popup" title="Fechar">${menuIcon("close")}</button>
+        </header>
+        <div class="utility-popup-body">${renderUtilityPopupContent(utilityPopupMode)}</div>
+      </section>
+    </main>`;
+  bindUtilityPopup();
+  if (utilityPopupMode === "focus") paintFocusTimer();
+}
+
+function bindUtilityPopup() {
+  const popup = app.querySelector<HTMLElement>(".utility-popup-window");
+  if (!popup) return;
+  popup.querySelector("[data-action=popup-close]")?.addEventListener("click", () => void closeUtilityPopup());
+  popup.querySelector<HTMLElement>(".utility-popup-drag-handle")?.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    void getCurrentWindow().startDragging().catch((error) => console.error("NÃ£o consegui mover o popup", error));
+  });
+  if (utilityPopupMode === "focus") {
+    popup.querySelector("[data-action=focus-toggle]")?.addEventListener("click", startFocus);
+    popup.querySelector("[data-action=focus-reset]")?.addEventListener("click", resetFocus);
+    popup.querySelector<HTMLInputElement>("#focus-minutes")?.addEventListener("change", (event) => {
+      if (focusState.running) return;
+      focusState.durationMs = Math.max(1, Math.min(180, Number((event.target as HTMLInputElement).value) || 25)) * 60_000;
+      focusState.remainingMs = focusState.durationMs;
+      persistFocus();
+      paintFocusTimer();
+    });
+  }
+  if (utilityPopupMode === "pocket") {
+    popup.querySelectorAll<HTMLElement>("[data-dropzone=pocket]").forEach(bindPocketDropzone);
+    popup.querySelectorAll<HTMLButtonElement>("[data-action=pocket-clipboard]").forEach((button) => button.addEventListener("click", () => void captureClipboardText(true)));
+    bindPocketItemActions(popup);
+  }
+  if (utilityPopupMode === "clipboard") {
+    popup.querySelector("[data-action=clipboard-capture]")?.addEventListener("click", () => void captureClipboardText());
+    bindClipboardEntryActions(popup);
+  }
+  if (utilityPopupMode === "customize") {
+    popup.querySelector<HTMLFormElement>("[data-action=pet-name-form]")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = event.currentTarget as HTMLFormElement;
+      const input = form.elements.namedItem("pet-name") as HTMLInputElement;
+      petName = input.value.trim().slice(0, 24) || "Mochi";
+      localStorage.setItem(KEYS.petName, petName);
+      updatePetAtmosphere();
+      renderUtilityPopup();
+    });
+    popup.querySelector<HTMLSelectElement>("#pet-skin")?.addEventListener("change", (event) => {
+      petSkin = (event.target as HTMLSelectElement).value as PetSkin;
+      localStorage.setItem(KEYS.petSkin, petSkin);
+      updatePetAtmosphere();
+    });
+    popup.querySelector<HTMLSelectElement>("#pet-accessory")?.addEventListener("change", (event) => {
+      petAccessory = (event.target as HTMLSelectElement).value as PetAccessory;
+      localStorage.setItem(KEYS.petAccessory, petAccessory);
+      updatePetAtmosphere();
+    });
+  }
+}
+
+async function openUtilityPopup(mode: UtilityPopupMode) {
+  localStorage.setItem(KEYS.utilityPopup, mode);
+  try {
+    const position = readUtilityPopupPosition();
+    await invoke("show_utility_popup", {
+      positionX: position?.x ?? null,
+      positionY: position?.y ?? null,
+    });
+  } catch (error) {
+    console.error("NÃ£o consegui abrir o popup do Edge Mochi", error);
+  }
+}
+
+async function closeUtilityPopup() {
+  flushUtilityPopupPosition();
+  utilityPopupMode = null;
+  localStorage.removeItem(KEYS.utilityPopup);
+  renderUtilityPopup();
+  await getCurrentWindow().hide().catch(() => undefined);
+}
+
+function startUtilityPopupWindow() {
+  renderUtilityPopup();
+  const currentWindow = getCurrentWindow();
+  void currentWindow.onMoved(({ payload }) => {
+    latestUtilityPopupPosition = { x: payload.x, y: payload.y };
+    if (utilityPopupPositionSaveTimer !== undefined) window.clearTimeout(utilityPopupPositionSaveTimer);
+    utilityPopupPositionSaveTimer = window.setTimeout(flushUtilityPopupPosition, 160);
+  });
+  void currentWindow.onFocusChanged(({ payload: focused }) => {
+    if (focused) {
+      if (utilityPopupBlurTimer !== undefined) window.clearTimeout(utilityPopupBlurTimer);
+      utilityPopupBlurTimer = undefined;
+      return;
+    }
+    if (utilityPopupBlurTimer !== undefined) window.clearTimeout(utilityPopupBlurTimer);
+    utilityPopupBlurTimer = window.setTimeout(() => {
+      utilityPopupBlurTimer = undefined;
+      void currentWindow.isFocused().then((stillFocused) => {
+        if (!stillFocused && utilityPopupMode) void closeUtilityPopup();
+      }).catch(() => undefined);
+    }, 160);
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && utilityPopupMode) void closeUtilityPopup();
+  });
+  void bindNativeFileDrop();
 }
 
 function renderShortcuts() {
@@ -576,18 +784,37 @@ function renderShortcuts() {
 function renderShortcutsPage() {
   return `
     <div class="shortcuts-page">
-      <div class="page-heading"><span>Atalhos e lançador</span></div>
-      <input class="launcher-search full-launcher-search" data-launcher-search placeholder="Buscar, abrir ou pesquisar na web…" aria-label="Buscar aplicativo, pasta ou endereço" />
-      <div class="launcher-items launcher-results">${renderLauncherItems()}</div>
-      <div class="page-heading shortcut-heading"><span>Seus atalhos</span><small>arraste para reordenar</small></div>
-      <div class="shortcut-grid" data-dropzone="shortcuts">${renderShortcuts()}</div>
-      <button class="secondary-action add-action-toggle" data-action="toggle-shortcut-form">＋ criar ação personalizada</button>
-      <form class="custom-action-form" data-action="shortcut-form" hidden>
-        <label>Nome<input name="action-name" maxlength="24" placeholder="Ex.: Começar o dia" required /></label>
-        <label>Aplicativo, pasta ou endereço<textarea name="action-targets" rows="2" placeholder="Um destino por linha. Ex.: wt.exe&#10;https://calendar.google.com" required></textarea></label>
-        <small>Uma ação pode abrir vários destinos, na ordem indicada.</small>
-        <button class="secondary-action">Salvar ação</button>
-      </form>
+      <section class="shortcuts-context-card">
+        <div class="shortcuts-intro">
+          <div class="shortcuts-message">
+            <div class="page-heading"><span>Atalhos</span><small>Seus destinos favoritos</small></div>
+            <button class="secondary-action add-action-toggle" data-action="toggle-shortcut-form">${menuIcon("plus")} Criar ação</button>
+          </div>
+          <label class="launcher-field shortcuts-search"><span>${menuIcon("search")}</span><input class="launcher-search full-launcher-search" data-launcher-search placeholder="Buscar app, pasta ou site" aria-label="Buscar aplicativo, pasta ou endereço" /></label>
+        </div>
+        <div class="home-divider"></div>
+        <section class="shortcuts-launcher">
+          <div class="section-head"><div class="section-title"><span class="section-kicker">ACESSO RÁPIDO</span><strong>Aplicativos</strong></div></div>
+          <div class="launcher-items launcher-results">${renderLauncherItems()}</div>
+        </section>
+        <button class="home-utility-summary shortcuts-clipboard" data-action="open-utility-popup" data-popup="clipboard">
+            <span class="utility-icon">${menuIcon("clipboard")}</span>
+            <span class="utility-copy"><strong>Prancheta</strong><small><span class="home-clipboard-count">${clipboardEntries.length}</span> itens recentes</small></span>
+            <span class="utility-chevron">${menuIcon("chevron")}</span>
+        </button>
+        <div class="home-divider"></div>
+        <div class="shortcuts-user-heading">
+          <div class="section-title"><span class="section-kicker">PERSONALIZADOS</span><strong>Seus atalhos</strong></div>
+          <small>Arraste para reordenar</small>
+        </div>
+        <div class="shortcut-grid" data-dropzone="shortcuts">${renderShortcuts()}</div>
+        <form class="custom-action-form" data-action="shortcut-form" hidden>
+          <label>Nome<input name="action-name" maxlength="24" placeholder="Ex.: Começar o dia" required /></label>
+          <label>Aplicativo, pasta ou endereço<textarea name="action-targets" rows="2" placeholder="Um destino por linha. Ex.: wt.exe&#10;https://calendar.google.com" required></textarea></label>
+          <small>Uma ação pode abrir vários destinos, na ordem indicada.</small>
+          <button class="secondary-action">Salvar ação</button>
+        </form>
+      </section>
     </div>`;
 }
 
@@ -609,6 +836,108 @@ function setPetMood(mood: string, durationMs = 1400) {
   }, durationMs + 30);
 }
 
+function setPetActivity(state: PetState, detail = "") {
+  app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => petMotionEngines.get(pet)?.setState(state, false, detail));
+}
+
+function setCodexPetActivity(state: PetState, detail = "") {
+  latestCodexPetState = { state, detail, occurredAt: Date.now() };
+  setPetActivity(state, detail);
+}
+
+function updateCodexIntegrationControls() {
+  const button = app.querySelector<HTMLButtonElement>("#codex-hooks-toggle");
+  const status = app.querySelector<HTMLElement>("#codex-hooks-status");
+  if (button) {
+    button.disabled = codexHooksBusy;
+    button.textContent = codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex";
+  }
+  if (status) status.textContent = codexHooksStatusMessage;
+}
+
+async function refreshCodexHooksStatus() {
+  try {
+    codexHooksEnabled = await invoke<boolean>("codex_hooks_enabled");
+    codexHooksStatusMessage = codexHooksEnabled
+      ? "Hook configurado. O Codex pode pedir para confiar nele na próxima sessão."
+      : "Desativado. O Mochi não acompanha sessões do Codex.";
+  } catch (error) {
+    codexHooksStatusMessage = `Não consegui consultar o Codex: ${String(error)}`;
+  } finally {
+    codexHooksBusy = false;
+  }
+  updateCodexIntegrationControls();
+}
+
+async function toggleCodexHooks() {
+  if (codexHooksBusy) return;
+  const enabled = !codexHooksEnabled;
+  codexHooksBusy = true;
+  codexHooksStatusMessage = enabled ? "Configurando o hook local…" : "Removendo o hook do Codex…";
+  updateCodexIntegrationControls();
+  try {
+    codexHooksEnabled = await invoke<boolean>("set_codex_hooks_enabled", { enabled });
+    codexHooksStatusMessage = codexHooksEnabled
+      ? "Hook configurado. Reinicie o Codex e aprove a confiança do hook do Mochi se solicitado."
+      : "Desconectado agora. Reinicie o Codex para descarregar o hook; os outros hooks foram preservados.";
+  } catch (error) {
+    codexHooksStatusMessage = `Não consegui atualizar o Codex: ${String(error)}`;
+  } finally {
+    codexHooksBusy = false;
+    updateCodexIntegrationControls();
+  }
+}
+
+function applyCodexHookEvents(events: CodexHookEvent[]) {
+  for (const event of events) {
+    switch (event.eventName) {
+      case "SessionStart":
+        setCodexPetActivity("idle");
+        break;
+      case "UserPromptSubmit":
+        setCodexPetActivity("thinking", "O Codex está pensando");
+        break;
+      case "PreToolUse":
+        setCodexPetActivity("working", event.toolName ? `O Codex está usando ${event.toolName}` : "O Codex está trabalhando");
+        break;
+      case "PermissionRequest":
+        setCodexPetActivity("approval", "O Codex está aguardando aprovação");
+        break;
+      case "PostToolUse":
+        setCodexPetActivity("thinking", "O Codex retomou o turno");
+        break;
+      case "SubagentStart":
+        setCodexPetActivity("working", event.agentType ? `O Codex delegou para ${event.agentType}` : "O Codex delegou uma tarefa");
+        break;
+      case "SubagentStop":
+        setCodexPetActivity("thinking", "O Codex retomou o turno");
+        break;
+      case "Stop":
+        setCodexPetActivity("finished", "O Codex terminou o turno");
+        break;
+      case "Interrupt":
+        setCodexPetActivity("question", "O turno do Codex foi interrompido");
+        break;
+      case "SessionEnd":
+        setCodexPetActivity("idle");
+        break;
+    }
+  }
+}
+
+async function pollCodexHookEvents() {
+  if (!codexHooksEnabled || codexPollPending) return;
+  codexPollPending = true;
+  try {
+    const events = await invoke<CodexHookEvent[]>("drain_codex_events");
+    if (events.length > 0) applyCodexHookEvents(events);
+  } catch {
+    // A temporary queue read failure should not interrupt the island or Codex.
+  } finally {
+    codexPollPending = false;
+  }
+}
+
 function savePocket(): boolean {
   try {
     localStorage.setItem(KEYS.pocket, JSON.stringify(pocketItems.slice(0, 8)));
@@ -622,6 +951,10 @@ function savePocket(): boolean {
 
 function showPetDropFeedback(message: string) {
   petDropFeedback = message;
+  const stage = app.querySelector<HTMLElement>(".pet-stage");
+  stage?.classList.add("has-drop-feedback");
+  const prompt = stage?.querySelector<HTMLElement>(".pet-drop-prompt");
+  if (prompt) prompt.textContent = message;
   if (petDropFeedbackTimer !== undefined) window.clearTimeout(petDropFeedbackTimer);
   petDropFeedbackTimer = window.setTimeout(() => {
     petDropFeedback = "";
@@ -633,63 +966,88 @@ function showPetDropFeedback(message: string) {
   }, 1800);
 }
 
+function setPetReceivingFile(receiving: boolean, position?: { x: number; y: number }, scale = 1) {
+  const pet = app.querySelector<HTMLElement>(".tab-view .pet");
+  const motion = pet ? petMotionEngines.get(pet) : undefined;
+  if (receiving) {
+    const x = position ? position.x / scale : undefined;
+    const y = position ? position.y / scale : undefined;
+    motion?.prepareForFile(x, y);
+  }
+  else motion?.cancelFileReceive();
+}
+
+function updatePetFileCursor(position: { x: number; y: number }, scale = 1) {
+  const pet = app.querySelector<HTMLElement>(".tab-view .pet");
+  const motion = pet ? petMotionEngines.get(pet) : undefined;
+  motion?.updateFileCursor(position.x / scale, position.y / scale);
+}
+
 function addPocketItem(item: PocketItem, origin?: { x: number; y: number }) {
   if (pocketItems.some((existing) => existing.value === item.value && existing.kind === item.kind)
     || pendingPocketValues.has(item.value)) {
+    setPetReceivingFile(false);
     pocketNotice = "Esse já está guardado";
     if (origin) showPetDropFeedback("Esse já está no Bolso");
-    updateActiveTab(activeTab);
+    refreshPocketUi();
     return;
   }
   const pendingItemsNotInPocket = [...pendingPocketValues].filter((value) =>
     !pocketItems.some((existing) => existing.value === value),
   ).length;
   if (pocketItems.length + pendingItemsNotInPocket >= 8) {
+    setPetReceivingFile(false);
     pocketNotice = "O bolso está cheio — tire algo antes";
     if (origin) showPetDropFeedback("O Bolso está cheio");
-    updateActiveTab(activeTab);
+    refreshPocketUi();
     return;
   }
   pendingPocketValues.add(item.value);
   pocketItems.unshift(item);
   pocketItems = pocketItems.slice(0, 8);
   if (!savePocket()) {
+    setPetReceivingFile(false);
     pocketItems = pocketItems.filter((existing) => existing.id !== item.id);
     pendingPocketValues.delete(item.value);
     if (origin) showPetDropFeedback("Não consegui guardar o arquivo");
-    updateActiveTab(activeTab);
+    refreshPocketUi();
     return;
   }
-  const pet = app.querySelector<HTMLElement>(".tab-view .pet") ?? app.querySelector<HTMLElement>(".brand-mark");
-  const bounds = pet?.getBoundingClientRect();
-  const start = origin ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-  const end = bounds ? { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 } : start;
-  const morsel = document.createElement("div");
-  morsel.className = "pocket-morsel";
-  morsel.textContent = item.kind === "image" ? "▧" : item.kind === "text" ? "¶" : "▤";
-  morsel.style.left = `${start.x}px`;
-  morsel.style.top = `${start.y}px`;
-  morsel.style.setProperty("--morsel-x", `${end.x - start.x}px`);
-  morsel.style.setProperty("--morsel-y", `${end.y - start.y}px`);
-  document.body.append(morsel);
-  if (pet) pet.classList.add("is-eating");
-  pocketNotice = `${petName} está comendo…`;
-  const petHint = app.querySelector<HTMLElement>(".pet-profile-hint");
-  if (petHint) petHint.textContent = `${petName} está comendo ${item.name}`;
+  const pet = app.querySelector<HTMLElement>(".tab-view .pet");
+  if (pet) {
+    const petTarget = pet.querySelector<HTMLCanvasElement>(".pet-canvas") ?? pet;
+    const bounds = petTarget.getBoundingClientRect();
+    const start = origin ?? { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    const end = { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height * 0.17 };
+    const morsel = document.createElement("div");
+    morsel.className = "pocket-morsel";
+    morsel.textContent = item.kind === "image" ? "▧" : item.kind === "text" ? "¶" : "▤";
+    morsel.style.left = `${start.x}px`;
+    morsel.style.top = `${start.y}px`;
+    morsel.style.setProperty("--morsel-x", `${end.x - start.x}px`);
+    morsel.style.setProperty("--morsel-y", `${end.y - start.y}px`);
+    document.body.append(morsel);
+    petMotionEngines.get(pet)?.gulp();
+    pocketNotice = `${petName} está comendo…`;
+    const petHint = app.querySelector<HTMLElement>(".pet-profile-hint");
+    if (petHint) petHint.textContent = `${petName} está comendo ${item.name}`;
+    setPetMood("chewing", 1400);
+    requestAnimationFrame(() => morsel.classList.add("is-flying"));
+    window.setTimeout(() => morsel.remove(), 500);
+  } else {
+    pocketNotice = "Guardado no Bolso — o original continua no lugar";
+  }
   pocketDropActive = false;
-  setPetMood("chewing", 720);
-  requestAnimationFrame(() => morsel.classList.add("is-flying"));
+  refreshPocketUi();
   window.setTimeout(() => {
-    morsel.remove();
     pendingPocketValues.delete(item.value);
     if (pocketItems.some((saved) => saved.id === item.id)) {
       pocketNotice = "Guardado no bolso — o original continua no lugar";
       if (origin) showPetDropFeedback("Guardado no Bolso do Mochi");
     }
     savePocket();
-    updateActiveTab(activeTab);
-    updatePetAtmosphere();
-  }, 650);
+    refreshPocketUi();
+  }, 1600);
 }
 
 function fileKind(path: string): PocketItem["kind"] {
@@ -705,9 +1063,10 @@ async function captureClipboardText(intoPocket = false, origin?: { x: number; y:
     const copiedText = (await invoke<string>("read_clipboard_text")).trim();
     const text = copiedText.slice(0, MAX_SAVED_TEXT);
     if (!text) {
-      if (intoPocket) pocketNotice = "A prancheta está vazia.";
-      else clipboardNotice = "A área de transferência está vazia.";
-      updateActiveTab(activeTab);
+     if (intoPocket) pocketNotice = "A prancheta está vazia.";
+     else clipboardNotice = "A área de transferência está vazia.";
+      if (intoPocket) refreshPocketUi();
+      else refreshClipboardUi();
       return;
     }
     if (intoPocket) {
@@ -719,13 +1078,14 @@ async function captureClipboardText(intoPocket = false, origin?: { x: number; y:
     const fresh = { id: makeId(), text, addedAt: Date.now() };
     const recent = [fresh, ...existing.filter((entry) => !entry.pinned)].slice(0, Math.max(0, 12 - pinned.length));
     clipboardEntries = [...pinned, ...recent].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || b.addedAt - a.addedAt);
-    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
-    clipboardNotice = copiedText.length > MAX_SAVED_TEXT ? "Guardei os primeiros 50 mil caracteres." : "Texto guardado nesta prancheta.";
-    updateActiveTab(activeTab);
-  } catch {
-    if (intoPocket) pocketNotice = "Não consegui ler o texto da prancheta.";
-    else clipboardNotice = "Não consegui ler o texto da prancheta.";
-    updateActiveTab(activeTab);
+   localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
+   clipboardNotice = copiedText.length > MAX_SAVED_TEXT ? "Guardei os primeiros 50 mil caracteres." : "Texto guardado nesta prancheta.";
+    refreshClipboardUi();
+ } catch {
+   if (intoPocket) pocketNotice = "Não consegui ler o texto da prancheta.";
+   else clipboardNotice = "Não consegui ler o texto da prancheta.";
+    if (intoPocket) refreshPocketUi();
+    else refreshClipboardUi();
   }
 }
 
@@ -733,10 +1093,10 @@ async function copyClipboardText(text: string) {
   try {
     await invoke("write_clipboard_text", { text });
     clipboardNotice = "Copiado para a área de transferência.";
-  } catch {
-    clipboardNotice = "Não consegui copiar este texto.";
-  }
-  updateActiveTab(activeTab);
+ } catch {
+   clipboardNotice = "Não consegui copiar este texto.";
+ }
+  refreshClipboardUi();
 }
 
 function startFocus() {
@@ -772,7 +1132,7 @@ function paintFocusTimer() {
   const progress = app.querySelector<HTMLElement>("#focus-progress");
   if (progress) progress.style.setProperty("--progress", `${100 - (remaining / Math.max(1, focusState.durationMs)) * 100}%`);
   const toggle = app.querySelector<HTMLButtonElement>("[data-action=focus-toggle]");
-  if (toggle) toggle.textContent = focusState.running ? "Pausar" : remaining === 0 ? "Recomeçar" : "Iniciar";
+  if (toggle) toggle.textContent = focusState.running ? "Pausar" : remaining === 0 ? "Recomeçar" : "Iniciar foco";
   const durationInput = app.querySelector<HTMLInputElement>("#focus-minutes");
   if (durationInput) durationInput.disabled = focusState.running;
   const status = app.querySelector<HTMLElement>("#focus-status");
@@ -789,6 +1149,7 @@ function finishFocus() {
   persistFocus();
   setPetMood("happy", 12_000);
   paintFocusTimer();
+  app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => petMotionEngines.get(pet)?.setState("finished"));
 }
 
 function tickFeatures() {
@@ -813,15 +1174,15 @@ async function refreshMediaInfo() {
   } catch {
     mediaInfo = { title: "", artist: "", playing: false };
   }
-  app.querySelectorAll<HTMLElement>(".media-title").forEach((element) => { element.textContent = mediaInfo.title || "Nada tocando agora"; });
-  app.querySelectorAll<HTMLElement>(".media-artist").forEach((element) => { element.textContent = mediaInfo.artist || "Se a música estiver tocando, use os controles"; });
-  app.querySelectorAll<HTMLElement>("[data-action=media-toggle]").forEach((element) => { element.textContent = mediaInfo.playing ? "Ⅱ" : "▶"; });
+ app.querySelectorAll<HTMLElement>(".media-title").forEach((element) => { element.textContent = mediaInfo.title || "Nada tocando agora"; });
+ app.querySelectorAll<HTMLElement>(".media-artist").forEach((element) => { element.textContent = mediaInfo.artist || "Quando algo tocar, aparece aqui"; });
+  app.querySelectorAll<HTMLElement>(".media-play-icon").forEach((element) => { element.innerHTML = menuIcon(mediaInfo.playing ? "pause" : "play"); });
 }
 
 function launchShortcut(shortcut: Shortcut) {
   if (shortcut.action === "focus") {
-    if (activeTab !== "home") updateActiveTab("home");
     if (!focusState.running) startFocus();
+    void openUtilityPopup("focus");
     return;
   }
   void invoke("open_targets", { targets: shortcut.targets }).catch(() => undefined);
@@ -842,50 +1203,56 @@ function launchSearch(value: string) {
 
 function bindPetInteractions(container: HTMLElement) {
   container.querySelectorAll<HTMLElement>(".pet").forEach((pet) => {
+    const motion = new PetMotionEngine(pet);
+    petMotionEngines.set(pet, motion);
+    if (latestCodexPetState && latestCodexPetState.state !== "idle") {
+      const age = Date.now() - latestCodexPetState.occurredAt;
+      const lifetime = latestCodexPetState.state === "finished" ? 2100 : latestCodexPetState.state === "question" ? 5000 : 30_000;
+      if (age <= lifetime) motion.setState(latestCodexPetState.state, false, latestCodexPetState.detail);
+    }
     pet.addEventListener("mouseenter", () => {
       if (petLoveTimer !== undefined) window.clearTimeout(petLoveTimer);
       petLoveTimer = window.setTimeout(() => {
         petLoveTimer = undefined;
         if (pet.matches(":hover") && Date.now() - lastPetLove > 6000) {
           lastPetLove = Date.now();
-          pet.classList.add("is-loving");
+          motion.love();
           setPetMood("happy", 1500);
-          window.setTimeout(() => pet.classList.remove("is-loving"), 1500);
         }
-      }, 1900);
+      }, 2000);
     });
     pet.addEventListener("mouseleave", () => {
       if (petLoveTimer !== undefined) window.clearTimeout(petLoveTimer);
       petLoveTimer = undefined;
-      pet.classList.remove("is-loving");
+      motion.lookAt(0, 0);
     });
     pet.addEventListener("click", () => {
-      if (petPokeReset !== undefined) window.clearTimeout(petPokeReset);
-      if (petModeTimer !== undefined) window.clearTimeout(petModeTimer);
-      pet.classList.remove("is-loving", "is-annoyed", "is-dizzy");
-      petPokes += 1;
-      if (petPokes >= 3) {
-        petPokes = 0;
-        pet.classList.add("is-dizzy");
-        setPetMood("dizzy", 1300);
-        petModeTimer = window.setTimeout(() => pet.classList.remove("is-dizzy"), 1300);
-      } else {
-        pet.classList.add("is-annoyed");
-        setPetMood("annoyed", 650);
-        petModeTimer = window.setTimeout(() => pet.classList.remove("is-annoyed"), 650);
-      }
-      petPokeReset = window.setTimeout(() => { petPokes = 0; }, 1800);
+      if (petLoveTimer !== undefined) window.clearTimeout(petLoveTimer);
+      petLoveTimer = undefined;
+      const reaction = motion.poke();
+      if (reaction === "dizzy") setPetMood("dizzy", 1550);
+      else if (reaction === "annoyed") setPetMood("annoyed", 800);
     });
   });
 }
 
 function bindPocketDropzone(dropzone: HTMLElement) {
-  dropzone.addEventListener("dragenter", (event) => { event.preventDefault(); pocketDropActive = true; dropzone.classList.add("is-dragging"); });
-  dropzone.addEventListener("dragover", (event) => { event.preventDefault(); dropzone.classList.add("is-dragging"); });
+  dropzone.addEventListener("dragenter", (event) => {
+    event.preventDefault();
+    pocketDropActive = true;
+    dropzone.classList.add("is-dragging");
+    setPetReceivingFile(true, { x: event.clientX, y: event.clientY });
+  });
+  dropzone.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    dropzone.classList.add("is-dragging");
+    updatePetFileCursor({ x: event.clientX, y: event.clientY });
+  });
   dropzone.addEventListener("dragleave", (event) => {
     if (!dropzone.contains(event.relatedTarget as Node | null)) {
       pocketDropActive = false;
       dropzone.classList.remove("is-dragging");
+      setPetReceivingFile(false);
     }
   });
   dropzone.addEventListener("drop", (event) => {
@@ -893,7 +1260,11 @@ function bindPocketDropzone(dropzone: HTMLElement) {
     pocketDropActive = false;
     dropzone.classList.remove("is-dragging");
     const text = event.dataTransfer?.getData("text/plain").trim();
-    if (text) addPocketItem({ id: makeId(), name: text.replace(/\s+/g, " ").slice(0, 28), kind: "text", value: text.slice(0, MAX_SAVED_TEXT), addedAt: Date.now(), truncated: text.length > MAX_SAVED_TEXT }, { x: event.clientX, y: event.clientY });
+    if (text) {
+      setPetReceivingFile(true, { x: event.clientX, y: event.clientY });
+      addPocketItem({ id: makeId(), name: text.replace(/\s+/g, " ").slice(0, 28), kind: "text", value: text.slice(0, MAX_SAVED_TEXT), addedAt: Date.now(), truncated: text.length > MAX_SAVED_TEXT }, { x: event.clientX, y: event.clientY });
+    }
+    else setPetReceivingFile(false);
   });
 }
 
@@ -902,28 +1273,38 @@ async function bindNativeFileDrop() {
     await getCurrentWindow().onDragDropEvent(async (event) => {
       if (event.payload.type === "enter") {
         pocketDropActive = true;
-        if (!settingsOpen) {
-          petPanel = null;
-          updateActiveTab("pet");
-        }
-        setExpanded(true);
+        const utilityPopup = getCurrentWindow().label === "utility-popup";
+        if (!utilityPopup && !settingsOpen) updateActiveTab("pet");
+        if (!utilityPopup) setExpanded(true);
         app.querySelector<HTMLElement>(".edge-island")?.classList.add("is-file-dragging");
         const dropzone = app.querySelector<HTMLElement>("[data-dropzone=pocket]");
         dropzone?.classList.add("is-dragging");
+        if (utilityPopup) {
+          const prompt = dropzone?.querySelector<HTMLElement>("strong");
+          if (prompt) prompt.textContent = "Pode soltar, eu pego!";
+        }
         const prompt = dropzone?.querySelector<HTMLElement>(".pet-drop-prompt");
         if (prompt) prompt.textContent = "Pode soltar, eu pego!";
+        nativeDragScale = await getCurrentWindow().scaleFactor().catch(() => 1);
+        setPetReceivingFile(true, event.payload.position, nativeDragScale);
         return;
       }
       if (event.payload.type === "over") {
         app.querySelector<HTMLElement>(".edge-island")?.classList.add("is-file-dragging");
         app.querySelector("[data-dropzone=pocket]")?.classList.add("is-dragging");
+        updatePetFileCursor(event.payload.position, nativeDragScale);
         return;
       }
       if (event.payload.type === "leave") {
         pocketDropActive = false;
+        setPetReceivingFile(false);
         app.querySelector<HTMLElement>(".edge-island")?.classList.remove("is-file-dragging");
         const dropzone = app.querySelector<HTMLElement>("[data-dropzone=pocket]");
         dropzone?.classList.remove("is-dragging");
+        if (getCurrentWindow().label === "utility-popup") {
+          const prompt = dropzone?.querySelector<HTMLElement>("strong");
+          if (prompt) prompt.textContent = "Solte um arquivo ou texto";
+        }
         const prompt = dropzone?.querySelector<HTMLElement>(".pet-drop-prompt");
         if (prompt) prompt.textContent = pocketItems.length ? "Arraste mais alguma coisa" : "Solte um arquivo ou texto no Mochi";
         return;
@@ -936,15 +1317,24 @@ async function bindNativeFileDrop() {
       const prompt = dropzone?.querySelector<HTMLElement>(".pet-drop-prompt");
       const paths = event.payload.paths.filter((path) => path.trim().length > 0);
       if (paths.length === 0) {
+        setPetReceivingFile(false);
         pocketNotice = "Não recebi o arquivo. Solte-o sobre o Mochi novamente.";
         showPetDropFeedback("Não recebi o arquivo");
+        if (getCurrentWindow().label === "utility-popup") {
+          const prompt = dropzone?.querySelector<HTMLElement>("strong");
+          if (prompt) prompt.textContent = "Não recebi o arquivo";
+        }
         if (prompt) prompt.textContent = "Não recebi o arquivo";
         updateActiveTab(activeTab);
         return;
       }
       if (prompt) prompt.textContent = `${petName} está comendo…`;
-      const scale = await getCurrentWindow().scaleFactor().catch(() => 1);
-      const origin = { x: event.payload.position.x / scale, y: event.payload.position.y / scale };
+      if (getCurrentWindow().label === "utility-popup") {
+        const popupPrompt = dropzone?.querySelector<HTMLElement>("strong");
+        if (popupPrompt) popupPrompt.textContent = "Guardando no Bolso…";
+      }
+      const origin = { x: event.payload.position.x / nativeDragScale, y: event.payload.position.y / nativeDragScale };
+      updatePetFileCursor(event.payload.position, nativeDragScale);
       for (const path of paths) {
         addPocketItem({ id: makeId(), name: fileName(path), kind: fileKind(path), value: path, addedAt: Date.now() }, origin);
       }
@@ -992,10 +1382,18 @@ function bindTabContent(tabView: HTMLElement) {
   }));
   tabView.querySelectorAll<HTMLInputElement>("[data-launcher-search]").forEach((input) => {
     input.addEventListener("input", () => {
-      const query = input.value.trim().toLowerCase();
+      const searchText = input.value.trim();
+      const query = searchText.toLowerCase();
       tabView.querySelectorAll<HTMLElement>(".launch-item").forEach((item) => {
-        item.hidden = !!query && !item.dataset.launchName?.includes(query);
+        const matches = !!query && !!item.dataset.launchName?.includes(query);
+        item.hidden = !!query && !matches;
+        item.classList.toggle("is-search-match", matches);
       });
+      const state = query && !focusState.running ? "searching" : focusState.running ? "working" : "idle";
+      setPetActivity(state, state === "searching" ? searchText : "");
+    });
+    input.addEventListener("blur", () => {
+      setPetActivity(focusState.running ? "working" : "idle");
     });
     input.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
@@ -1010,62 +1408,14 @@ function bindTabContent(tabView: HTMLElement) {
     const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
     void captureClipboardText(true, { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 });
   });
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=copy-clipboard]").forEach((button) => button.addEventListener("click", () => {
-    const entry = clipboardEntries.find((item) => item.id === button.dataset.clipboardId);
-    if (entry) void copyClipboardText(entry.text);
-  }));
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=toggle-clipboard-pin]").forEach((button) => button.addEventListener("click", () => {
-    const entry = clipboardEntries.find((item) => item.id === button.dataset.clipboardId);
-    if (!entry) return;
-    entry.pinned = !entry.pinned;
-    clipboardEntries.sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || b.addedAt - a.addedAt);
-    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
-    updateActiveTab(activeTab);
-  }));
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=remove-clipboard]").forEach((button) => button.addEventListener("click", () => {
-    clipboardEntries = clipboardEntries.filter((item) => item.id !== button.dataset.clipboardId);
-    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
-    updateActiveTab(activeTab);
-  }));
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=open-pocket]").forEach((button) => button.addEventListener("click", () => {
-    const item = pocketItems.find((entry) => entry.id === button.dataset.pocketId);
-    if (!item) return;
-    if (item.kind === "text") void copyClipboardText(item.value);
-    else void invoke("open_targets", { targets: [item.value] }).catch(() => undefined);
-  }));
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=remove-pocket]").forEach((button) => button.addEventListener("click", () => {
-    pocketItems = pocketItems.filter((entry) => entry.id !== button.dataset.pocketId);
-    savePocket();
-    updateActiveTab(activeTab);
-  }));
+  bindClipboardEntryActions(tabView);
+  bindPocketItemActions(tabView);
   tabView.querySelectorAll<HTMLElement>("[data-dropzone=pocket]").forEach(bindPocketDropzone);
 
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=pet-panel-open]").forEach((button) => button.addEventListener("click", () => {
-    petPanel = button.dataset.panel === "customize" ? "customize" : "pocket";
-    updateActiveTab("pet");
+  tabView.querySelectorAll<HTMLButtonElement>("[data-action=open-utility-popup]").forEach((button) => button.addEventListener("click", () => {
+    const mode = button.dataset.popup;
+    if (mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard") void openUtilityPopup(mode);
   }));
-  tabView.querySelectorAll<HTMLButtonElement>("[data-action=pet-panel-close]").forEach((button) => button.addEventListener("click", () => {
-    petPanel = null;
-    updateActiveTab("pet");
-  }));
-
-  tabView.querySelector<HTMLFormElement>("[data-action=pet-name-form]")?.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const input = (event.currentTarget as HTMLFormElement).elements.namedItem("pet-name") as HTMLInputElement;
-    petName = input.value.trim().slice(0, 24) || "Mochi";
-    localStorage.setItem(KEYS.petName, petName);
-    updateActiveTab(activeTab);
-  });
-  tabView.querySelector<HTMLSelectElement>("#pet-skin")?.addEventListener("change", (event) => {
-    petSkin = (event.target as HTMLSelectElement).value as PetSkin;
-    localStorage.setItem(KEYS.petSkin, petSkin);
-    updatePetAtmosphere();
-  });
-  tabView.querySelector<HTMLSelectElement>("#pet-accessory")?.addEventListener("change", (event) => {
-    petAccessory = (event.target as HTMLSelectElement).value as PetAccessory;
-    localStorage.setItem(KEYS.petAccessory, petAccessory);
-    updatePetAtmosphere();
-  });
 
   const form = tabView.querySelector<HTMLFormElement>("[data-action=shortcut-form]");
   form?.addEventListener("submit", (event) => {
@@ -1124,10 +1474,76 @@ function bindTabContent(tabView: HTMLElement) {
   updatePetAtmosphere();
 }
 
+function bindPocketItemActions(container: ParentNode) {
+  container.querySelectorAll<HTMLButtonElement>("[data-action=open-pocket]").forEach((button) => button.addEventListener("click", () => {
+    const item = pocketItems.find((entry) => entry.id === button.dataset.pocketId);
+    if (!item) return;
+    if (item.kind === "text") void copyClipboardText(item.value);
+    else void invoke("open_targets", { targets: [item.value] }).catch(() => undefined);
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=remove-pocket]").forEach((button) => button.addEventListener("click", () => {
+    pocketItems = pocketItems.filter((entry) => entry.id !== button.dataset.pocketId);
+    savePocket();
+    refreshPocketUi();
+  }));
+}
+
+function bindClipboardEntryActions(container: ParentNode) {
+  container.querySelectorAll<HTMLButtonElement>("[data-action=copy-clipboard]").forEach((button) => button.addEventListener("click", () => {
+    const entry = clipboardEntries.find((item) => item.id === button.dataset.clipboardId);
+    if (entry) void copyClipboardText(entry.text);
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=toggle-clipboard-pin]").forEach((button) => button.addEventListener("click", () => {
+    const entry = clipboardEntries.find((item) => item.id === button.dataset.clipboardId);
+    if (!entry) return;
+    entry.pinned = !entry.pinned;
+    clipboardEntries.sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || b.addedAt - a.addedAt);
+    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
+    refreshClipboardUi();
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=remove-clipboard]").forEach((button) => button.addEventListener("click", () => {
+    clipboardEntries = clipboardEntries.filter((item) => item.id !== button.dataset.clipboardId);
+    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
+    refreshClipboardUi();
+  }));
+}
+
+function refreshClipboardUi() {
+  const lists = app.querySelectorAll<HTMLElement>(".clipboard-list");
+  lists.forEach((list) => {
+    list.innerHTML = renderClipboardEntries(list.closest(".utility-clipboard") ? 12 : 3);
+    bindClipboardEntryActions(list);
+  });
+  app.querySelectorAll<HTMLElement>(".clipboard-status").forEach((status) => { status.textContent = clipboardNotice; });
+  app.querySelectorAll<HTMLElement>(".home-clipboard-count").forEach((count) => { count.textContent = String(clipboardEntries.length); });
+  refreshUtilityPopupSubtitle();
+}
+
+function refreshPocketUi() {
+  const status = app.querySelector<HTMLElement>(".pocket-status");
+  if (status) status.textContent = pocketNotice;
+  const items = app.querySelector<HTMLElement>(".pocket-items");
+  if (items) {
+    items.innerHTML = renderPocketItems();
+    bindPocketItemActions(items);
+  }
+  const dropPrompt = app.querySelector<HTMLElement>(".pocket-dropzone strong");
+  if (dropPrompt) dropPrompt.textContent = pocketDropActive ? "Pode soltar, eu pego!" : "Solte um arquivo ou texto";
+  app.querySelectorAll<HTMLElement>(".home-pocket-count").forEach((count) => { count.textContent = `${pocketItems.length}/8`; });
+  refreshUtilityPopupSubtitle();
+  updatePetAtmosphere();
+}
+
+function refreshUtilityPopupSubtitle() {
+  const subtitle = app.querySelector<HTMLElement>("[data-popup-subtitle]");
+  if (!subtitle || !utilityPopupMode) return;
+  if (utilityPopupMode === "pocket") subtitle.textContent = `${pocketItems.length}/8 itens · os originais ficam no lugar`;
+  else if (utilityPopupMode === "clipboard") subtitle.textContent = `${clipboardEntries.length} itens recentes`;
+}
+
 function updateActiveTab(tab: MenuTab) {
   const previousTab = activeTab;
   activeTab = tab;
-  if (tab !== "pet") petPanel = null;
   const tabView = app.querySelector<HTMLElement>(".tab-view");
   if (!tabView) return;
 
@@ -1154,12 +1570,13 @@ function renderSettingsContent() {
   const lengthLabel = edge === "left" ? "Altura da barrinha" : "Largura da barrinha";
   return `
     <div class="settings-page">
-      <header class="menu-header settings-header">
-        <button class="back-button" data-action="settings-back" aria-label="Voltar ao menu">&lsaquo;</button>
+     <header class="menu-header settings-header">
+        <button class="back-button" data-action="settings-back" aria-label="Voltar ao menu">${menuIcon("back")}</button>
         <div><strong>Configurações</strong><small>aparência e comportamento</small></div>
-        <button class="icon-button" data-action="close" aria-label="Fechar">&times;</button>
+        <button class="icon-button close-button" data-action="close" aria-label="Fechar">${menuIcon("close")}</button>
       </header>
       <div class="settings-scroll">
+        <section class="settings-context-card">
         <p class="settings-intro">Ajuste a barrinha e escolha as telas onde o Edge Mochi aparece.</p>
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-length">${lengthLabel}</label><output id="bar-length-value">${barLength} px</output></div>
@@ -1192,8 +1609,15 @@ function renderSettingsContent() {
           <input id="close-delay" type="range" min="${MIN_CLOSE_DELAY}" max="${MAX_CLOSE_DELAY}" step="50" value="${closeDelay}" />
           <div class="range-labels"><span>imediato</span><span>mais lento</span></div>
         </section>
+        <section class="control-card setting-card codex-integration-card">
+          <div class="setting-heading">Mochi e Codex</div>
+          <p class="codex-integration-copy">Nas sessões locais do Codex, o Mochi reage ao envio de prompts, ao uso de ferramentas, a aprovações e ao fim do turno. Só ficam na fila local o tipo do evento, o nome da ferramenta e o tipo do subagente; o texto do chat não é armazenado nem enviado.</p>
+          <small class="codex-integration-status" id="codex-hooks-status" role="status">${escapeHtml(codexHooksStatusMessage)}</small>
+          <button class="reset-button codex-integration-toggle" id="codex-hooks-toggle" type="button" ${codexHooksBusy ? "disabled" : ""}>${codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex"}</button>
+        </section>
         <p class="settings-note">As curvas do notch acompanham o comprimento e a orientação da barrinha.</p>
         <button class="reset-button" data-action="reset-settings">Restaurar configurações padrão</button>
+        </section>
       </div>
     </div>`;
 }
@@ -1205,11 +1629,16 @@ function setExpanded(value: boolean) {
   freezeIslandGeometry(island);
   expanded = value;
   island.classList.toggle("is-expanded", value);
-  if (value && !hasGreetedPet) {
-    hasGreetedPet = true;
+  if (value) {
     const pet = island.querySelector<HTMLElement>(".pet");
-    pet?.classList.add("is-greeting");
-    window.setTimeout(() => pet?.classList.remove("is-greeting"), 2400);
+    const motion = pet ? petMotionEngines.get(pet) : undefined;
+    if (motion) {
+      if (hasGreetedPet) motion.greet();
+      else {
+        hasGreetedPet = true;
+        motion.welcome();
+      }
+    }
   }
   if (hoverCloseTimer !== undefined) {
     window.clearTimeout(hoverCloseTimer);
@@ -1248,6 +1677,7 @@ function bindRange(
 }
 
 function bindSettings() {
+  app.querySelector<HTMLButtonElement>("#codex-hooks-toggle")?.addEventListener("click", () => void toggleCodexHooks());
   bindRange("#bar-length", (value) => { barLength = value; }, "#bar-length-value", (value) => `${value} px`);
   bindRange("#bar-thickness", (value) => { barThickness = value; }, "#bar-thickness-value", (value) => `${value} px`);
   bindRange("#close-delay", (value) => { closeDelay = value; }, "#close-delay-value", (value) => `${value} ms`);
@@ -1287,15 +1717,15 @@ function render() {
         <button class="peek-line" aria-label="Abrir Edge Mochi"><span></span><span></span><span></span></button>
         <div class="island-content">
           <header class="menu-header">
-            <div class="brand-mark">✦</div>
-            <div class="header-title"><strong>Edge Mochi</strong><small>controles rápidos</small></div>
             <nav class="menu-tabs" role="group" aria-label="Seções do Edge Mochi">
-              <button class="icon-button menu-tab ${activeTab === "home" ? "is-active" : ""}" aria-pressed="${activeTab === "home"}" data-tab="home" aria-label="Início" title="Início">⌂</button>
-              <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">◉</button>
-              <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">⌘</button>
+              <button class="icon-button menu-tab ${activeTab === "home" ? "is-active" : ""}" aria-pressed="${activeTab === "home"}" data-tab="home" aria-label="Início" title="Início">${menuIcon("home")}</button>
+              <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">${menuIcon("pet")}</button>
+              <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
             </nav>
-            <button class="icon-button settings-button" data-action="settings" aria-label="Abrir configurações" title="Configurações">⚙</button>
-            <button class="icon-button close-button" data-action="close" aria-label="Fechar" title="Fechar">×</button>
+            <div class="menu-header-actions">
+              <button class="icon-button settings-button" data-action="settings" aria-label="Abrir configurações" title="Configurações">${menuIcon("settings")}</button>
+              <button class="icon-button close-button" data-action="close" aria-label="Fechar" title="Fechar">${menuIcon("close")}</button>
+            </div>
           </header>
           <main class="tab-view" role="tabpanel">${renderActiveTab()}</main>
           <footer><span>Ctrl + Space</span><span class="footer-hint">encoste na barrinha</span></footer>
@@ -1318,6 +1748,8 @@ function render() {
     setExpanded(true);
   });
   body.addEventListener("pointerleave", () => {
+    const pet = app.querySelector<HTMLElement>(".tab-view .pet");
+    if (pet) petMotionEngines.get(pet)?.lookAt(0, 0);
     if (expanded) scheduleClose();
   });
   island.querySelector(".peek-line")?.addEventListener("click", (event) => {
@@ -1328,13 +1760,12 @@ function render() {
   body.addEventListener("pointermove", (event) => {
     if (!expanded) return;
     const pet = app.querySelector<HTMLElement>(".tab-view .pet");
-    const petFace = pet?.querySelector<HTMLElement>(".pet-face");
-    if (!pet || !petFace) return;
+    const motion = pet ? petMotionEngines.get(pet) : undefined;
+    if (!pet || !motion) return;
     const rect = pet.getBoundingClientRect();
-    const x = Math.max(-2, Math.min(2, (event.clientX - (rect.left + rect.width / 2)) / 9));
-    const y = Math.max(-2, Math.min(2, (event.clientY - (rect.top + rect.height / 2)) / 9));
-    petFace.style.setProperty("--look-x", `${x}px`);
-    petFace.style.setProperty("--look-y", `${y}px`);
+    const x = (event.clientX - (rect.left + rect.width / 2)) / Math.max(1, rect.width * 0.55);
+    const y = (event.clientY - (rect.top + rect.height / 2)) / Math.max(1, rect.height * 0.55);
+    motion.lookAt(x, y);
   });
 
   app.querySelector("[data-action=settings]")?.addEventListener("click", (event) => {
@@ -1382,6 +1813,8 @@ function render() {
 
 async function startMainWindow() {
   render();
+  void refreshCodexHooksStatus();
+  window.setInterval(() => void pollCodexHookEvents(), 300);
   await bindNativeFileDrop();
   void invoke<number>("get_system_volume").then((value) => {
     volume = value;
@@ -1438,8 +1871,23 @@ void listen<CursorPosition>("edge-mochi-cursor", ({ payload }) => {
   wasPointerInNativeIsland = inIsland;
 });
 
-window.setInterval(tickFeatures, 1000);
+const currentWindowLabel = getCurrentWindow().label;
+if (currentWindowLabel === "utility-popup") window.setInterval(() => {
+  if (utilityPopupMode === "focus") paintFocusTimer();
+}, 250);
+else window.setInterval(tickFeatures, 1000);
+
 window.addEventListener("storage", (event) => {
+  if (event.key === KEYS.utilityPopup) {
+    if (currentWindowLabel === "utility-popup") {
+      renderUtilityPopup();
+      if (utilityPopupMode && utilityPopupBlurTimer !== undefined) {
+        window.clearTimeout(utilityPopupBlurTimer);
+        utilityPopupBlurTimer = undefined;
+      }
+    }
+    return;
+  }
   if (event.key === KEYS.pocket) pocketItems = readPocketItems();
   else if (event.key === KEYS.clipboard) clipboardEntries = readClipboardEntries();
   else if (event.key === KEYS.shortcuts) shortcuts = readShortcuts();
@@ -1448,10 +1896,27 @@ window.addEventListener("storage", (event) => {
   else if (event.key === KEYS.petAccessory) petAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
   else if (event.key === KEYS.focus) focusState = readFocusState();
   else return;
-  if (event.key !== KEYS.focus) updateActiveTab(activeTab);
+
+  if (currentWindowLabel === "utility-popup") {
+    if (event.key === KEYS.focus) paintFocusTimer();
+    else if (event.key === KEYS.pocket) refreshPocketUi();
+    else if (event.key === KEYS.clipboard) refreshClipboardUi();
+    else if ([KEYS.petName, KEYS.petSkin, KEYS.petAccessory].includes(event.key)) renderUtilityPopup();
+    return;
+  }
+
+  if (event.key === KEYS.focus || event.key === KEYS.pocket || event.key === KEYS.petName || event.key === KEYS.petSkin || event.key === KEYS.petAccessory) {
+    updatePetAtmosphere();
+    app.querySelectorAll<HTMLElement>(".pet-name").forEach((name) => { name.textContent = petName; });
+    app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => pet.setAttribute("aria-label", petName));
+  }
+  if (event.key === KEYS.pocket) refreshPocketUi();
+  else if (event.key === KEYS.clipboard) refreshClipboardUi();
+  else if (event.key === KEYS.shortcuts) updateActiveTab(activeTab);
   paintFocusTimer();
 });
-if (getCurrentWindow().label === "main") void startMainWindow();
+if (currentWindowLabel === "main") void startMainWindow();
+else if (currentWindowLabel === "utility-popup") startUtilityPopupWindow();
 else {
   render();
   bindNativeFileDrop();

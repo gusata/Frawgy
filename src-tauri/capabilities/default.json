@@ -2,9 +2,11 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Permite ao Mochi escutar seus eventos de janela e ler o fator de escala.",
-  "windows": ["main", "display-*"],
+  "windows": ["main", "display-*", "utility-popup"],
   "permissions": [
     "core:event:default",
-    "core:window:default"
+    "core:window:default",
+    "core:window:allow-hide",
+    "core:window:allow-start-dragging"
   ]
 }

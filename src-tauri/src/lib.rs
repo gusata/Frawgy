@@ -32,6 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+mod codex_hooks;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayInfo {
@@ -537,6 +539,75 @@ fn place_window(window: &WebviewWindow, edge: Edge, monitor: &Monitor) -> Result
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn show_utility_popup(
+    app: AppHandle,
+    window: WebviewWindow,
+    position_x: Option<i32>,
+    position_y: Option<i32>,
+) -> Result<(), String> {
+    let fallback_monitor = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .ok_or_else(|| "nenhum monitor disponÃ­vel para o popup".to_string())?;
+    let saved_position = position_x.zip(position_y);
+    let monitor = saved_position
+        .and_then(|(x, y)| {
+            app.available_monitors().ok()?.into_iter().find(|monitor| {
+                let origin = monitor.position();
+                let size = monitor.size();
+                x >= origin.x
+                    && y >= origin.y
+                    && x < origin.x.saturating_add(size.width as i32)
+                    && y < origin.y.saturating_add(size.height as i32)
+            })
+        })
+        .unwrap_or(fallback_monitor);
+    let popup = app
+        .get_webview_window("utility-popup")
+        .ok_or_else(|| "janela do popup nÃ£o encontrada".to_string())?;
+
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let scale = monitor.scale_factor();
+    let logical_width = (f64::from(monitor_size.width) / scale - 32.0).clamp(240.0, 400.0);
+    let logical_height = (f64::from(monitor_size.height) / scale - 32.0).clamp(300.0, 500.0);
+    let size = PhysicalSize::new(
+        logical_to_physical(logical_width.round() as u32, scale),
+        logical_to_physical(logical_height.round() as u32, scale),
+    );
+    let max_x = monitor_position
+        .x
+        .saturating_add(monitor_size.width as i32)
+        .saturating_sub(size.width as i32)
+        .max(monitor_position.x);
+    let max_y = monitor_position
+        .y
+        .saturating_add(monitor_size.height as i32)
+        .saturating_sub(size.height as i32)
+        .max(monitor_position.y);
+    let centered_x = monitor_position.x + monitor_size.width.saturating_sub(size.width) as i32 / 2;
+    let centered_y = monitor_position.y + monitor_size.height.saturating_sub(size.height) as i32 / 2;
+    let (desired_x, desired_y) = saved_position.unwrap_or((centered_x, centered_y));
+    let position = PhysicalPosition::new(
+        desired_x.clamp(monitor_position.x, max_x),
+        desired_y.clamp(monitor_position.y, max_y),
+    );
+
+    popup
+        .set_size(size)
+        .map_err(|error| error.to_string())?;
+    popup
+        .set_position(position)
+        .map_err(|error| error.to_string())?;
+    popup
+        .set_always_on_top(true)
+        .map_err(|error| error.to_string())?;
+    popup.show().map_err(|error| error.to_string())?;
+    popup.set_focus().map_err(|error| error.to_string())
+}
+
 fn ensure_display_windows(app: &AppHandle, count: usize) -> Result<(), String> {
     for index in 1..count {
         let label = format!("display-{index}");
@@ -690,7 +761,11 @@ pub fn run() {
             run_shortcut,
             list_displays,
             set_island_rect,
-            apply_display_layout
+            apply_display_layout,
+            show_utility_popup,
+            codex_hooks::codex_hooks_enabled,
+            codex_hooks::set_codex_hooks_enabled,
+            codex_hooks::drain_codex_events
         ])
         .run(tauri::generate_context!())
         .expect("error while running Edge Mochi");
