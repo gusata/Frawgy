@@ -176,7 +176,7 @@ function makeTrack(): Track {
   return { value: 0, from: 0, to: 0, startsAt: 0, duration: 0, easing: "out", priority: 0 };
 }
 
-/** Canvas renderer and independent motion channels for one Mochi. */
+/** Canvas renderer and independent motion channels for Ghosty. */
 export class PetMotionEngine {
   private readonly canvas: HTMLCanvasElement;
   private readonly context: CanvasRenderingContext2D | null;
@@ -429,15 +429,15 @@ export class PetMotionEngine {
   private getActivityExplanation(): string | null {
     switch (this.activity) {
       case "working": return "Seu temporizador de foco está em andamento.";
-      case "thinking": return "Mochi está no estado de pensamento.";
+      case "thinking": return "Ghosty está no estado de pensamento.";
       case "searching": return this.activityDetail
         ? `Buscando “${this.activityDetail}” nos atalhos.`
         : "Buscando um app ou atalho.";
-      case "approval": return "Mochi está esperando sua confirmação.";
-      case "question": return "Mochi precisa de uma resposta para continuar.";
+      case "approval": return "Ghosty está esperando sua confirmação.";
+      case "question": return "Ghosty precisa de uma resposta para continuar.";
       case "error": return "A última ação encontrou um erro.";
-      case "finished": return "O ciclo de foco foi concluído.";
-      case "ratelimit": return "Mochi precisa esperar antes de tentar de novo.";
+      case "finished": return this.activityDetail || "O ciclo de foco foi concluído.";
+      case "ratelimit": return "Ghosty precisa esperar antes de tentar de novo.";
       default: return null;
     }
   }
@@ -899,7 +899,7 @@ export class PetMotionEngine {
 
   private resize() {
     const rect = this.canvas.getBoundingClientRect();
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    const pixelRatio = Math.min(Math.max(window.devicePixelRatio || 1, 2), 3);
     const width = Math.max(1, Math.round(rect.width * pixelRatio));
     const height = Math.max(1, Math.round(rect.height * pixelRatio));
     if (this.canvas.width !== width || this.canvas.height !== height) {
@@ -1238,11 +1238,11 @@ export class PetMotionEngine {
     };
 
     pose.handLeft = t < 2.58
-      ? easing(segment(t, 1.36, 1.5), "back")
-      : 1 - easing(segment(t, 2.58, 2.77), "in");
+      ? easing(segment(1.36, 1.5), "back")
+      : 1 - easing(segment(2.58, 2.77), "in");
     pose.handRight = t < 2.58
-      ? easing(segment(t, 1.4, 1.58), "back")
-      : 1 - easing(segment(t, 2.61, 2.8), "in");
+      ? easing(segment(1.4, 1.58), "back")
+      : 1 - easing(segment(2.61, 2.8), "in");
     if (t >= 1.52 && t < 2.58) pose.wave = t - 1.52;
 
     if (t >= 1.25 && t < 1.52) {

@@ -1,6 +1,6 @@
-# Edge Mochi
+# Edge Ghosty
 
-Um painel rápido para Windows, inspirado na ilha do Coucou. O Edge Mochi fica preso à borda da tela, abre com hover e reúne controles e pequenos recursos do dia a dia.
+Um painel rápido para Windows, inspirado na ilha do Coucou. O Edge Ghosty fica preso à borda da tela, abre com hover e reúne controles e pequenos recursos do dia a dia.
 
 ## O que tem no painel
 
@@ -9,9 +9,10 @@ Um painel rápido para Windows, inspirado na ilha do Coucou. O Edge Mochi fica p
 - Lançador para aplicativos, pastas, endereços e pesquisas na web.
 - Ações personalizadas que podem abrir vários destinos.
 - Prancheta de texto: capture, fixe, copie de volta ou remova entradas.
-- Bolso do Mochi: solte arquivos, imagens ou texto para guardá-los e abrir depois. O arquivo original não é movido nem apagado; o app guarda o caminho.
+- Bolso do Ghosty: solte arquivos, imagens ou texto para guardá-los e abrir depois. O arquivo original não é movido nem apagado; o app guarda o caminho.
 - Pet personalizável com nome, aparência e acessório. O painel de vidro muda de cor suavemente conforme o humor e o item guardado.
 - Abas Home, Pet e Atalhos em três botões compactos no cabeçalho.
+- Nas sessões locais do Codex, as bolinhas pulsam durante tarefas e Ghosty salta para comemorar quando uma tarefa termina.
 
 As preferências, atalhos, histórico de texto e itens do Bolso ficam no armazenamento local do WebView. A leitura da prancheta acontece quando você escolhe capturar; o app não coleta cada cópia em segundo plano.
 

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permite ao Mochi escutar seus eventos de janela e ler o fator de escala.",
+  "description": "Permite ao Ghosty escutar seus eventos de janela e ler o fator de escala.",
   "windows": ["main", "display-*", "utility-popup"],
   "permissions": [
     "core:event:default",

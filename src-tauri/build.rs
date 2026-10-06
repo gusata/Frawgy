@@ -6,7 +6,7 @@ fn main() {
 }
 
 // Tauri's Windows resource step expects an ICO even while developing. Keep a
-// tiny generated placeholder here until the final Edge Mochi branding exists.
+// tiny generated placeholder here until the final Edge Ghosty branding exists.
 fn ensure_dev_icon() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let icon_path = manifest_dir.join("icons").join("icon.ico");

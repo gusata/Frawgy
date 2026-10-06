@@ -35,7 +35,17 @@ type LayoutUpdate = {
   activeLabel: string;
   expanded: boolean;
 };
-type CodexHookEvent = { eventName: string; occurredAt: number; toolName: string | null; agentType: string | null };
+type CodexHookEvent = {
+  eventName: string;
+  occurredAt: number;
+  toolName: string | null;
+  agentType: string | null;
+  approvalId: string | null;
+  approvalDescription: string | null;
+  approvalExpiresAt: number | null;
+};
+type CodexApproval = { requestId: string; toolName: string; description: string; expiresAt: number };
+type CodexApprovalDecision = "allow" | "deny";
 
 const DEFAULT_SHORTCUTS: Shortcut[] = [
   { id: "terminal", name: "Terminal", glyph: "⌘", targets: ["wt.exe"] },
@@ -51,6 +61,23 @@ const LAUNCHER_DEFAULTS: Shortcut[] = [
 ];
 
 const KEYS = {
+  length: "edge-ghosty.bar-height",
+  thickness: "edge-ghosty.bar-width",
+  edge: "edge-ghosty.edge",
+  closeDelay: "edge-ghosty.close-delay",
+  displays: "edge-ghosty.display-ids",
+  allDisplays: "edge-ghosty.all-displays",
+  shortcuts: "edge-ghosty.shortcuts",
+  pocket: "edge-ghosty.pocket",
+  clipboard: "edge-ghosty.clipboard",
+  petName: "edge-ghosty.pet-name",
+  petSkin: "edge-ghosty.pet-skin",
+  petAccessory: "edge-ghosty.pet-accessory",
+  focus: "edge-ghosty.focus",
+  utilityPopup: "edge-ghosty.utility-popup",
+  utilityPopupPosition: "edge-ghosty.utility-popup-position",
+};
+const LEGACY_KEYS = {
   length: "edge-mochi.bar-height",
   thickness: "edge-mochi.bar-width",
   edge: "edge-mochi.edge",
@@ -67,6 +94,13 @@ const KEYS = {
   utilityPopup: "edge-mochi.utility-popup",
   utilityPopupPosition: "edge-mochi.utility-popup-position",
 };
+for (const name of Object.keys(KEYS) as Array<keyof typeof KEYS>) {
+  const legacyValue = localStorage.getItem(LEGACY_KEYS[name]);
+  if (localStorage.getItem(KEYS[name]) === null && legacyValue !== null) {
+    localStorage.setItem(KEYS[name], name === "petName" && legacyValue === "Mochi" ? "Ghosty" : legacyValue);
+  }
+}
+if (localStorage.getItem(KEYS.petName) === "Mochi") localStorage.setItem(KEYS.petName, "Ghosty");
 const DEFAULTS = {
   length: 80,
   thickness: 10,
@@ -124,7 +158,7 @@ let draggedId = "";
 let shortcuts = readShortcuts();
 let pocketItems = readPocketItems();
 let clipboardEntries = readClipboardEntries();
-let petName = localStorage.getItem(KEYS.petName) || "Mochi";
+let petName = localStorage.getItem(KEYS.petName) || "Ghosty";
 let petSkin: PetSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight"], "pearl");
 let petAccessory: PetAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
 let focusState = readFocusState();
@@ -134,6 +168,15 @@ let codexHooksBusy = true;
 let codexHooksStatusMessage = "Verificando a configuração do Codex…";
 let codexPollPending = false;
 let latestCodexPetState: { state: PetState; detail: string; occurredAt: number } | null = null;
+let codexTaskRunning = false;
+let taskCompletionTimer: number | undefined;
+let pendingCodexApprovals: CodexApproval[] = [];
+let codexApprovalSubmitting = false;
+let codexApprovalError = "";
+let codexApprovalPresentationKey = "";
+const codexApprovalExpiryTimers = new Map<string, number>();
+let approvalHitBoundsInterval: number | undefined;
+let approvalHitBoundsStopTimer: number | undefined;
 let petMoodOverride = "";
 let petMoodUntil = 0;
 let pocketDropActive = false;
@@ -156,7 +199,7 @@ let geometryMotion: {
   radius: Tracked;
 } | undefined;
 let lastPublishedBody: HTMLElement | undefined;
-let lastPublishedRect: (CursorPosition & { width: number; height: number }) | undefined;
+let lastPublishedRect: { x: number; y: number; width: number; height: number } | undefined;
 let rectPublishAttempt = 0;
 let wasPointerInNativeIsland = false;
 
@@ -294,12 +337,21 @@ function setBodyGeometry(body: HTMLElement, width: number, height: number, radiu
 }
 
 function publishNativeHitBounds(body: HTMLElement) {
-  const rect = body.getBoundingClientRect();
+  const rects = [body.getBoundingClientRect()];
+  const island = body.closest<HTMLElement>(".edge-island");
+  const approvalToast = island?.querySelector<HTMLElement>(".ghosty-completion");
+  if (!expanded && pendingCodexApprovals.length > 0 && approvalToast?.getAttribute("aria-hidden") === "false") {
+    rects.push(approvalToast.getBoundingClientRect());
+  }
+  const left = Math.min(...rects.map((rect) => rect.left));
+  const top = Math.min(...rects.map((rect) => rect.top));
+  const right = Math.max(...rects.map((rect) => rect.right));
+  const bottom = Math.max(...rects.map((rect) => rect.bottom));
   if (lastPublishedBody !== body) {
     lastPublishedBody = body;
     lastPublishedRect = undefined;
   }
-  const next = { x: rect.left, y: rect.top, width: rect.width, height: rect.height };
+  const next = { x: left, y: top, width: right - left, height: bottom - top };
   if (lastPublishedRect && Math.abs(next.x - lastPublishedRect.x) < 0.5
     && Math.abs(next.y - lastPublishedRect.y) < 0.5
     && Math.abs(next.width - lastPublishedRect.width) < 0.5
@@ -313,6 +365,33 @@ function publishNativeHitBounds(body: HTMLElement) {
       if (lastPublishedBody === body && body.isConnected) publishNativeHitBounds(body);
     }, 100);
   });
+}
+
+function stopApprovalHitBoundsTracking() {
+  if (approvalHitBoundsInterval !== undefined) window.clearInterval(approvalHitBoundsInterval);
+  if (approvalHitBoundsStopTimer !== undefined) window.clearTimeout(approvalHitBoundsStopTimer);
+  approvalHitBoundsInterval = undefined;
+  approvalHitBoundsStopTimer = undefined;
+}
+
+function refreshApprovalHitBounds() {
+  stopApprovalHitBoundsTracking();
+  const body = app.querySelector<HTMLElement>(".island-body");
+  if (!body) return;
+  publishNativeHitBounds(body);
+  if (expanded || pendingCodexApprovals.length === 0) return;
+  approvalHitBoundsInterval = window.setInterval(() => {
+    if (expanded || pendingCodexApprovals.length === 0 || !body.isConnected) {
+      stopApprovalHitBoundsTracking();
+      if (body.isConnected) publishNativeHitBounds(body);
+      return;
+    }
+    publishNativeHitBounds(body);
+  }, 50);
+  approvalHitBoundsStopTimer = window.setTimeout(() => {
+    stopApprovalHitBoundsTracking();
+    if (body.isConnected) publishNativeHitBounds(body);
+  }, 3600);
 }
 
 function freezeIslandGeometry(island: HTMLElement) {
@@ -532,7 +611,7 @@ function renderHomePage() {
         <div class="home-message">
           ${renderPetCharacter("pet-home")}
           <div class="home-message-copy">
-            <span class="section-kicker">EDGE MOCHI</span>
+            <span class="section-kicker">EDGE GHOSTY</span>
             <strong>Tudo tranquilo por aqui.</strong>
             <small>Música, volume e atalhos sempre à mão.</small>
           </div>
@@ -566,9 +645,9 @@ function renderPetPage() {
         ${renderPetCharacter("pet-large")}
         <span class="pet-name">${escapeHtml(petName)}</span>
         <strong class="pet-drop-prompt" aria-live="polite">${pocketDropActive ? "Pode soltar, eu pego!" : escapeHtml(petDropFeedback)}</strong>
-     <div class="pet-tools" aria-label="Ações do Mochi">
-          <button class="pet-tool" data-action="open-utility-popup" data-popup="pocket" aria-label="Abrir bolso do Mochi" title="Bolso">${menuIcon("pocket")}</button>
-          <button class="pet-tool" data-action="open-utility-popup" data-popup="customize" aria-label="Personalizar Mochi" title="Personalizar">${menuIcon("settings")}</button>
+     <div class="pet-tools" aria-label="Ações do Ghosty">
+          <button class="pet-tool" data-action="open-utility-popup" data-popup="pocket" aria-label="Abrir bolso do Ghosty" title="Bolso">${menuIcon("pocket")}</button>
+          <button class="pet-tool" data-action="open-utility-popup" data-popup="customize" aria-label="Personalizar Ghosty" title="Personalizar">${menuIcon("settings")}</button>
         </div>
       </div>
     </div>`;
@@ -608,7 +687,7 @@ function renderUtilityPopupContent(mode: UtilityPopupMode) {
     const progress = focusState.durationMs > 0 ? 100 - remaining / focusState.durationMs * 100 : 0;
     return `
       <section class="utility-focus">
-        <div class="utility-focus-intro"><span class="section-kicker">TEMPO DE FOCO</span><strong>Um passo de cada vez.</strong><small>O Mochi acompanha seu ciclo com você.</small></div>
+        <div class="utility-focus-intro"><span class="section-kicker">TEMPO DE FOCO</span><strong>Um passo de cada vez.</strong><small>O Ghosty acompanha seu ciclo com você.</small></div>
         <div class="utility-focus-clock" id="focus-countdown">${formatDuration(remaining)}</div>
         <div class="focus-progress utility-focus-progress"><i id="focus-progress" style="--progress:${progress}%"></i></div>
         <div class="utility-focus-controls">
@@ -654,7 +733,7 @@ function renderUtilityPopup() {
   const copy: Record<UtilityPopupMode, { title: string; subtitle: string }> = {
     focus: { title: "Foco", subtitle: "Seu tempo, no seu ritmo" },
     pocket: { title: `Bolso do ${petName}`, subtitle: `${pocketItems.length}/8 itens · os originais ficam no lugar` },
-    customize: { title: "Personalizar o Mochi", subtitle: "Nome, aparência e acessório" },
+    customize: { title: "Personalizar o Ghosty", subtitle: "Nome, aparência e acessório" },
     clipboard: { title: "Prancheta", subtitle: `${clipboardEntries.length} itens recentes` },
   };
   const heading = copy[utilityPopupMode];
@@ -662,7 +741,7 @@ function renderUtilityPopup() {
     <main class="utility-popup-window" data-popup="${utilityPopupMode}">
       <section class="utility-popup-card">
         <header class="utility-popup-header">
-          <div class="utility-popup-drag-handle"><span class="section-kicker">EDGE MOCHI</span><strong>${escapeHtml(heading.title)}</strong><small data-popup-subtitle>${escapeHtml(heading.subtitle)}</small></div>
+          <div class="utility-popup-drag-handle"><span class="section-kicker">EDGE GHOSTY</span><strong>${escapeHtml(heading.title)}</strong><small data-popup-subtitle>${escapeHtml(heading.subtitle)}</small></div>
           <button class="utility-popup-close" data-action="popup-close" aria-label="Fechar popup" title="Fechar">${menuIcon("close")}</button>
         </header>
         <div class="utility-popup-body">${renderUtilityPopupContent(utilityPopupMode)}</div>
@@ -706,7 +785,7 @@ function bindUtilityPopup() {
       event.preventDefault();
       const form = event.currentTarget as HTMLFormElement;
       const input = form.elements.namedItem("pet-name") as HTMLInputElement;
-      petName = input.value.trim().slice(0, 24) || "Mochi";
+      petName = input.value.trim().slice(0, 24) || "Ghosty";
       localStorage.setItem(KEYS.petName, petName);
       updatePetAtmosphere();
       renderUtilityPopup();
@@ -733,7 +812,7 @@ async function openUtilityPopup(mode: UtilityPopupMode) {
       positionY: position?.y ?? null,
     });
   } catch (error) {
-    console.error("NÃ£o consegui abrir o popup do Edge Mochi", error);
+    console.error("NÃ£o consegui abrir o popup do Edge Ghosty", error);
   }
 }
 
@@ -845,6 +924,194 @@ function setCodexPetActivity(state: PetState, detail = "") {
   setPetActivity(state, detail);
 }
 
+function setCodexTaskRunning(running: boolean) {
+  codexTaskRunning = running;
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  island?.classList.toggle("is-task-running", running);
+  if (running) island?.classList.remove("is-task-complete");
+  island?.querySelector(".peek-line")?.setAttribute(
+    "aria-label",
+    running ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty",
+  );
+}
+
+function setCodexApprovalButtons(container: ParentNode, approval: CodexApproval | null) {
+  container.querySelectorAll<HTMLButtonElement>("[data-ghosty-approval]").forEach((button) => {
+    button.dataset.requestId = approval?.requestId ?? "";
+    button.disabled = !approval || codexApprovalSubmitting;
+  });
+}
+
+function updateCodexApprovalPresentation() {
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  if (!island) return;
+  const approval = pendingCodexApprovals[0] ?? null;
+  const toast = island.querySelector<HTMLElement>(".ghosty-completion");
+  const inline = island.querySelector<HTMLElement>(".ghosty-inline-approval");
+  const externalVisible = Boolean(approval && !expanded);
+  const inlineVisible = Boolean(approval && expanded);
+
+  island.classList.toggle("is-approval-pending", Boolean(approval));
+  island.classList.toggle("is-approval-inline", inlineVisible);
+  toast?.setAttribute("aria-hidden", String(!externalVisible));
+  inline?.setAttribute("aria-hidden", String(!inlineVisible));
+
+  const toolLabel = approval?.toolName || "Ferramenta do Codex";
+  const presentationKey = approval ? `${inlineVisible ? "inline" : "external"}:${approval.requestId}` : "";
+  const presentationChanged = presentationKey !== codexApprovalPresentationKey;
+  if (toast) {
+    if (externalVisible) {
+      if (presentationChanged || !toast.classList.contains("is-approval-entering")) {
+        toast.classList.remove("is-approval-entering");
+        void toast.offsetWidth;
+        toast.classList.add("is-approval-entering");
+      }
+    } else {
+      toast.classList.remove("is-approval-entering");
+    }
+  }
+  if (inline) {
+    if (inlineVisible) {
+      if (presentationChanged || !inline.classList.contains("is-entering")) {
+        inline.classList.remove("is-entering");
+        void inline.offsetWidth;
+        inline.classList.add("is-entering");
+      }
+    } else {
+      inline.classList.remove("is-entering");
+    }
+  }
+  codexApprovalPresentationKey = presentationKey;
+  const copy = island.querySelector<HTMLElement>("#ghosty-completion-copy");
+  const liveRegion = island.querySelector<HTMLElement>("#ghosty-completion-live");
+  const description = island.querySelector<HTMLElement>("#ghosty-approval-description");
+  const tool = island.querySelector<HTMLElement>("#ghosty-approval-tool");
+  const inlineDescription = island.querySelector<HTMLElement>("#ghosty-inline-approval-description");
+  const inlineTool = island.querySelector<HTMLElement>("#ghosty-inline-approval-tool");
+  if (copy && approval) copy.textContent = "Autorizar esta ação?";
+  if (liveRegion) liveRegion.textContent = externalVisible && approval
+    ? `O Codex pediu autorização para ${approval.toolName}: ${approval.description}`
+    : "";
+  if (description) {
+    description.textContent = approval?.description ?? "";
+    description.hidden = !approval;
+  }
+  if (tool) {
+    tool.textContent = toolLabel;
+    tool.hidden = !approval;
+  }
+  if (inlineDescription) inlineDescription.textContent = approval?.description ?? "";
+  if (inlineTool) inlineTool.textContent = toolLabel;
+  island.querySelectorAll<HTMLElement>(".ghosty-approval-kicker").forEach((kicker) => {
+    kicker.hidden = !approval;
+  });
+  island.querySelectorAll<HTMLElement>(".ghosty-completion-kicker").forEach((kicker) => {
+    kicker.textContent = approval ? "SUA DECISÃO" : "PRONTINHO!";
+  });
+  island.querySelectorAll<HTMLElement>(".ghosty-approval-actions").forEach((actions) => {
+    actions.hidden = !approval;
+  });
+  island.querySelectorAll<HTMLElement>(".ghosty-approval-error").forEach((message) => {
+    message.textContent = codexApprovalError;
+    message.hidden = !codexApprovalError;
+  });
+  setCodexApprovalButtons(island, approval);
+  refreshApprovalHitBounds();
+}
+
+function clearTaskCompletionToast(island = app.querySelector<HTMLElement>(".edge-island")) {
+  if (taskCompletionTimer !== undefined) window.clearTimeout(taskCompletionTimer);
+  taskCompletionTimer = undefined;
+  island?.classList.remove("is-task-complete");
+  island?.querySelector("#ghosty-completion-live")?.replaceChildren();
+}
+
+function expireCodexApproval(requestId: string) {
+  const wasCurrent = pendingCodexApprovals[0]?.requestId === requestId;
+  pendingCodexApprovals = pendingCodexApprovals.filter((approval) => approval.requestId !== requestId);
+  codexApprovalExpiryTimers.delete(requestId);
+  if (wasCurrent) {
+    codexApprovalSubmitting = false;
+    codexApprovalError = "";
+  }
+  updateCodexApprovalPresentation();
+}
+
+function clearPendingCodexApprovals() {
+  for (const timer of codexApprovalExpiryTimers.values()) window.clearTimeout(timer);
+  codexApprovalExpiryTimers.clear();
+  pendingCodexApprovals = [];
+  codexApprovalSubmitting = false;
+  codexApprovalError = "";
+  updateCodexApprovalPresentation();
+}
+
+function queueCodexApproval(event: CodexHookEvent) {
+  if (!event.approvalId || !event.approvalDescription || pendingCodexApprovals.some((item) => item.requestId === event.approvalId)) return;
+  const expiresAt = event.approvalExpiresAt ?? event.occurredAt + 570_000;
+  if (expiresAt <= Date.now()) return;
+  pendingCodexApprovals.push({
+    requestId: event.approvalId,
+    toolName: event.toolName || "Codex",
+    description: event.approvalDescription,
+    expiresAt,
+  });
+  codexApprovalError = "";
+  const timer = window.setTimeout(() => expireCodexApproval(event.approvalId!), Math.max(0, expiresAt - Date.now()));
+  codexApprovalExpiryTimers.set(event.approvalId, timer);
+  clearTaskCompletionToast();
+  setCodexTaskRunning(true);
+  setCodexPetActivity("approval", `Aprovação solicitada para ${event.toolName || "uma ferramenta do Codex"}`);
+  updateCodexApprovalPresentation();
+}
+
+async function resolveCodexApproval(requestId: string, decision: CodexApprovalDecision) {
+  const approval = pendingCodexApprovals[0];
+  if (!approval || approval.requestId !== requestId || codexApprovalSubmitting) return;
+  codexApprovalSubmitting = true;
+  codexApprovalError = "";
+  updateCodexApprovalPresentation();
+  try {
+    await invoke("resolve_codex_approval", { requestId, decision });
+  } catch (error) {
+    codexApprovalSubmitting = false;
+    codexApprovalError = `Não consegui enviar a decisão: ${String(error)}`;
+    updateCodexApprovalPresentation();
+    return;
+  }
+
+  const timer = codexApprovalExpiryTimers.get(requestId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  codexApprovalExpiryTimers.delete(requestId);
+  pendingCodexApprovals = pendingCodexApprovals.filter((item) => item.requestId !== requestId);
+  codexApprovalSubmitting = false;
+  codexApprovalError = "";
+  updateCodexApprovalPresentation();
+  setCodexPetActivity(decision === "allow" ? "thinking" : "question", decision === "allow" ? "Ação aprovada" : "Ação recusada");
+}
+
+function showGhostyTaskCompletion(message: string) {
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  const toast = island?.querySelector<HTMLElement>(".ghosty-completion");
+  const copy = island?.querySelector<HTMLElement>("#ghosty-completion-copy");
+  const liveRegion = island?.querySelector<HTMLElement>("#ghosty-completion-live");
+  if (!island || !toast || !copy || !liveRegion || expanded || pendingCodexApprovals.length > 0) return;
+
+  clearTaskCompletionToast(island);
+  updateCodexApprovalPresentation();
+  copy.textContent = message;
+  liveRegion.textContent = message;
+  toast.setAttribute("aria-hidden", "false");
+  void island.offsetWidth;
+  island.classList.add("is-task-complete");
+  taskCompletionTimer = window.setTimeout(() => {
+    island.classList.remove("is-task-complete");
+    toast.setAttribute("aria-hidden", "true");
+    liveRegion.textContent = "";
+    taskCompletionTimer = undefined;
+  }, 3500);
+}
+
 function updateCodexIntegrationControls() {
   const button = app.querySelector<HTMLButtonElement>("#codex-hooks-toggle");
   const status = app.querySelector<HTMLElement>("#codex-hooks-status");
@@ -858,9 +1125,18 @@ function updateCodexIntegrationControls() {
 async function refreshCodexHooksStatus() {
   try {
     codexHooksEnabled = await invoke<boolean>("codex_hooks_enabled");
+    let updated = false;
+    if (codexHooksEnabled) {
+      const sync = await invoke<{ enabled: boolean; updated: boolean }>("sync_codex_hooks_if_enabled");
+      codexHooksEnabled = sync.enabled;
+      updated = sync.updated;
+    }
+    if (!codexHooksEnabled) setCodexTaskRunning(false);
     codexHooksStatusMessage = codexHooksEnabled
-      ? "Hook configurado. O Codex pode pedir para confiar nele na próxima sessão."
-      : "Desativado. O Mochi não acompanha sessões do Codex.";
+      ? updated
+        ? "Atualizei o hook. Reinicie o Codex e aprove o hook do Ghosty se solicitado."
+        : "Hook configurado. Reinicie o Codex para aplicar as respostas de aprovação pelo Ghosty."
+      : "Desativado. O Ghosty não acompanha sessões do Codex.";
   } catch (error) {
     codexHooksStatusMessage = `Não consegui consultar o Codex: ${String(error)}`;
   } finally {
@@ -877,8 +1153,12 @@ async function toggleCodexHooks() {
   updateCodexIntegrationControls();
   try {
     codexHooksEnabled = await invoke<boolean>("set_codex_hooks_enabled", { enabled });
+    if (!codexHooksEnabled) {
+      setCodexTaskRunning(false);
+      clearPendingCodexApprovals();
+    }
     codexHooksStatusMessage = codexHooksEnabled
-      ? "Hook configurado. Reinicie o Codex e aprove a confiança do hook do Mochi se solicitado."
+      ? "Hook configurado. Reinicie o Codex e aprove a atualização do hook do Ghosty se solicitado."
       : "Desconectado agora. Reinicie o Codex para descarregar o hook; os outros hooks foram preservados.";
   } catch (error) {
     codexHooksStatusMessage = `Não consegui atualizar o Codex: ${String(error)}`;
@@ -892,33 +1172,46 @@ function applyCodexHookEvents(events: CodexHookEvent[]) {
   for (const event of events) {
     switch (event.eventName) {
       case "SessionStart":
+        setCodexTaskRunning(false);
         setCodexPetActivity("idle");
         break;
       case "UserPromptSubmit":
+        setCodexTaskRunning(true);
         setCodexPetActivity("thinking", "O Codex está pensando");
         break;
       case "PreToolUse":
+        setCodexTaskRunning(true);
         setCodexPetActivity("working", event.toolName ? `O Codex está usando ${event.toolName}` : "O Codex está trabalhando");
         break;
       case "PermissionRequest":
-        setCodexPetActivity("approval", "O Codex está aguardando aprovação");
+        queueCodexApproval(event);
         break;
       case "PostToolUse":
+        setCodexTaskRunning(true);
         setCodexPetActivity("thinking", "O Codex retomou o turno");
         break;
       case "SubagentStart":
+        setCodexTaskRunning(true);
         setCodexPetActivity("working", event.agentType ? `O Codex delegou para ${event.agentType}` : "O Codex delegou uma tarefa");
         break;
       case "SubagentStop":
+        setCodexTaskRunning(true);
         setCodexPetActivity("thinking", "O Codex retomou o turno");
         break;
       case "Stop":
-        setCodexPetActivity("finished", "O Codex terminou o turno");
+        setCodexTaskRunning(false);
+        clearPendingCodexApprovals();
+        setCodexPetActivity("finished", "Tarefa concluída!");
+        showGhostyTaskCompletion("Tarefa concluída!");
         break;
       case "Interrupt":
+        setCodexTaskRunning(false);
+        clearPendingCodexApprovals();
         setCodexPetActivity("question", "O turno do Codex foi interrompido");
         break;
       case "SessionEnd":
+        setCodexTaskRunning(false);
+        clearPendingCodexApprovals();
         setCodexPetActivity("idle");
         break;
     }
@@ -943,7 +1236,7 @@ function savePocket(): boolean {
     localStorage.setItem(KEYS.pocket, JSON.stringify(pocketItems.slice(0, 8)));
     return true;
   } catch (error) {
-    console.error("Não consegui salvar o Bolso do Mochi", error);
+    console.error("Não consegui salvar o Bolso do Ghosty", error);
     pocketNotice = "Não consegui salvar no armazenamento deste app";
     return false;
   }
@@ -1043,7 +1336,7 @@ function addPocketItem(item: PocketItem, origin?: { x: number; y: number }) {
     pendingPocketValues.delete(item.value);
     if (pocketItems.some((saved) => saved.id === item.id)) {
       pocketNotice = "Guardado no bolso — o original continua no lugar";
-      if (origin) showPetDropFeedback("Guardado no Bolso do Mochi");
+      if (origin) showPetDropFeedback("Guardado no Bolso do Ghosty");
     }
     savePocket();
     refreshPocketUi();
@@ -1075,7 +1368,7 @@ async function captureClipboardText(intoPocket = false, origin?: { x: number; y:
     }
     const existing = clipboardEntries.filter((entry) => entry.text !== text);
     const pinned = existing.filter((entry) => entry.pinned);
-    const fresh = { id: makeId(), text, addedAt: Date.now() };
+    const fresh: ClipboardEntry = { id: makeId(), text, addedAt: Date.now() };
     const recent = [fresh, ...existing.filter((entry) => !entry.pinned)].slice(0, Math.max(0, 12 - pinned.length));
     clipboardEntries = [...pinned, ...recent].sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || b.addedAt - a.addedAt);
    localStorage.setItem(KEYS.clipboard, JSON.stringify(clipboardEntries));
@@ -1136,7 +1429,7 @@ function paintFocusTimer() {
   const durationInput = app.querySelector<HTMLInputElement>("#focus-minutes");
   if (durationInput) durationInput.disabled = focusState.running;
   const status = app.querySelector<HTMLElement>("#focus-status");
-  if (status) status.textContent = focusState.running ? "Mochi está focando com você" : remaining === 0 ? "Ciclo completo · hora de alongar" : "Escolha de 1 a 180 minutos";
+  if (status) status.textContent = focusState.running ? "Ghosty está focando com você" : remaining === 0 ? "Ciclo completo · hora de alongar" : "Escolha de 1 a 180 minutos";
   updatePetAtmosphere();
   const moodLabel = app.querySelector<HTMLElement>(".pet-mood-label");
   if (moodLabel) moodLabel.textContent = petMoodLabel();
@@ -1306,7 +1599,7 @@ async function bindNativeFileDrop() {
           if (prompt) prompt.textContent = "Solte um arquivo ou texto";
         }
         const prompt = dropzone?.querySelector<HTMLElement>(".pet-drop-prompt");
-        if (prompt) prompt.textContent = pocketItems.length ? "Arraste mais alguma coisa" : "Solte um arquivo ou texto no Mochi";
+        if (prompt) prompt.textContent = pocketItems.length ? "Arraste mais alguma coisa" : "Solte um arquivo ou texto no Ghosty";
         return;
       }
 
@@ -1318,7 +1611,7 @@ async function bindNativeFileDrop() {
       const paths = event.payload.paths.filter((path) => path.trim().length > 0);
       if (paths.length === 0) {
         setPetReceivingFile(false);
-        pocketNotice = "Não recebi o arquivo. Solte-o sobre o Mochi novamente.";
+        pocketNotice = "Não recebi o arquivo. Solte-o sobre o Ghosty novamente.";
         showPetDropFeedback("Não recebi o arquivo");
         if (getCurrentWindow().label === "utility-popup") {
           const prompt = dropzone?.querySelector<HTMLElement>("strong");
@@ -1577,7 +1870,7 @@ function renderSettingsContent() {
       </header>
       <div class="settings-scroll">
         <section class="settings-context-card">
-        <p class="settings-intro">Ajuste a barrinha e escolha as telas onde o Edge Mochi aparece.</p>
+        <p class="settings-intro">Ajuste a barrinha e escolha as telas onde o Edge Ghosty aparece.</p>
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-length">${lengthLabel}</label><output id="bar-length-value">${barLength} px</output></div>
           <input id="bar-length" type="range" min="${MIN_LENGTH}" max="${MAX_LENGTH}" step="${LENGTH_STEP}" value="${barLength}" />
@@ -1610,8 +1903,8 @@ function renderSettingsContent() {
           <div class="range-labels"><span>imediato</span><span>mais lento</span></div>
         </section>
         <section class="control-card setting-card codex-integration-card">
-          <div class="setting-heading">Mochi e Codex</div>
-          <p class="codex-integration-copy">Nas sessões locais do Codex, o Mochi reage ao envio de prompts, ao uso de ferramentas, a aprovações e ao fim do turno. Só ficam na fila local o tipo do evento, o nome da ferramenta e o tipo do subagente; o texto do chat não é armazenado nem enviado.</p>
+          <div class="setting-heading">Ghosty e Codex</div>
+          <p class="codex-integration-copy">Nas sessões locais do Codex, as bolinhas indicam atividade e o Ghosty mostra pedidos de aprovação e conclusões. A descrição resumida da ação pendente fica na fila local só até você decidir; texto do chat e resultados de ferramentas não são guardados nem enviados.</p>
           <small class="codex-integration-status" id="codex-hooks-status" role="status">${escapeHtml(codexHooksStatusMessage)}</small>
           <button class="reset-button codex-integration-toggle" id="codex-hooks-toggle" type="button" ${codexHooksBusy ? "disabled" : ""}>${codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex"}</button>
         </section>
@@ -1629,6 +1922,8 @@ function setExpanded(value: boolean) {
   freezeIslandGeometry(island);
   expanded = value;
   island.classList.toggle("is-expanded", value);
+  if (value) clearTaskCompletionToast(island);
+  updateCodexApprovalPresentation();
   if (value) {
     const pet = island.querySelector<HTMLElement>(".pet");
     const motion = pet ? petMotionEngines.get(pet) : undefined;
@@ -1710,14 +2005,27 @@ function bindSettings() {
   });
 }
 
+function bindCodexApprovalButtons(container: ParentNode) {
+  container.querySelectorAll<HTMLButtonElement>("[data-ghosty-approval]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const requestId = button.dataset.requestId;
+      const decision = button.dataset.ghostyApproval;
+      if (requestId && (decision === "allow" || decision === "deny")) {
+        void resolveCodexApproval(requestId, decision);
+      }
+    });
+  });
+}
+
 function render() {
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${settingsOpen ? "settings-open" : ""}" aria-label="Edge Mochi">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
-        <button class="peek-line" aria-label="Abrir Edge Mochi"><span></span><span></span><span></span></button>
+        <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
         <div class="island-content">
           <header class="menu-header">
-            <nav class="menu-tabs" role="group" aria-label="Seções do Edge Mochi">
+            <nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
               <button class="icon-button menu-tab ${activeTab === "home" ? "is-active" : ""}" aria-pressed="${activeTab === "home"}" data-tab="home" aria-label="Início" title="Início">${menuIcon("home")}</button>
               <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">${menuIcon("pet")}</button>
               <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
@@ -1730,7 +2038,38 @@ function render() {
           <main class="tab-view" role="tabpanel">${renderActiveTab()}</main>
           <footer><span>Ctrl + Space</span><span class="footer-hint">encoste na barrinha</span></footer>
         </div>
+        <div class="ghosty-inline-approval" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ghosty-inline-approval-title">
+          ${renderPetCharacter("ghosty-inline-approval-pet")}
+          <div class="ghosty-inline-approval-card">
+            <span class="ghosty-inline-approval-kicker">SUA DECISÃO</span>
+            <strong id="ghosty-inline-approval-title">Autorizar esta ação?</strong>
+            <small class="ghosty-inline-approval-tool" id="ghosty-inline-approval-tool"></small>
+            <p class="ghosty-inline-approval-description" id="ghosty-inline-approval-description"></p>
+            <div class="ghosty-approval-actions">
+              <button type="button" data-ghosty-approval="deny">Recusar</button>
+              <button type="button" data-ghosty-approval="allow">Aprovar</button>
+            </div>
+            <p class="ghosty-approval-error" role="status" hidden></p>
+          </div>
+        </div>
       </div>
+      <div class="ghosty-completion" aria-hidden="true">
+        <div class="pet ghosty-completion-pet" data-skin="${petSkin}" data-accessory="${petAccessory}" data-mood="happy" aria-hidden="true">
+          <canvas class="pet-canvas" aria-hidden="true"></canvas>
+        </div>
+        <div class="ghosty-completion-card">
+          <span class="ghosty-completion-kicker">PRONTINHO!</span>
+          <strong id="ghosty-completion-copy">Tarefa concluída!</strong>
+          <small class="ghosty-approval-tool" id="ghosty-approval-tool" hidden></small>
+          <p class="ghosty-approval-description" id="ghosty-approval-description" hidden></p>
+          <div class="ghosty-approval-actions" hidden>
+            <button type="button" data-ghosty-approval="deny">Recusar</button>
+            <button type="button" data-ghosty-approval="allow">Aprovar</button>
+          </div>
+          <p class="ghosty-approval-error" role="status" hidden></p>
+        </div>
+      </div>
+      <span class="task-completion-live" id="ghosty-completion-live" role="status" aria-live="polite"></span>
     </section>`;
 
   const island = app.querySelector<HTMLElement>(".edge-island")!;
@@ -1800,6 +2139,12 @@ function render() {
 
   const tabView = island.querySelector<HTMLElement>(".tab-view");
   if (tabView) bindTabContent(tabView);
+  const completionPet = island.querySelector<HTMLElement>(".ghosty-completion");
+  if (completionPet) bindPetInteractions(completionPet);
+  const inlineApproval = island.querySelector<HTMLElement>(".ghosty-inline-approval");
+  if (inlineApproval) bindPetInteractions(inlineApproval);
+  bindCodexApprovalButtons(island);
+  updateCodexApprovalPresentation();
   paintFocusTimer();
   island.addEventListener("click", (event) => {
     const tabButton = (event.target as Element).closest<HTMLButtonElement>("[data-tab]");
@@ -1844,7 +2189,7 @@ async function startMainWindow() {
   }
 }
 
-void listen<LayoutUpdate>("edge-mochi-layout-updated", ({ payload }) => {
+void listen<LayoutUpdate>("edge-ghosty-layout-updated", ({ payload }) => {
   if (payload.activeLabel === getCurrentWindow().label) return;
   edge = payload.edge;
   barLength = payload.barLength;
@@ -1857,14 +2202,19 @@ void listen<LayoutUpdate>("edge-mochi-layout-updated", ({ payload }) => {
   render();
 });
 
-void listen<CursorPosition>("edge-mochi-cursor", ({ payload }) => {
+void listen<CursorPosition>("edge-ghosty-cursor", ({ payload }) => {
   const inIsland = payload.inside;
+  const bodyRect = app.querySelector<HTMLElement>(".island-body")?.getBoundingClientRect();
+  const pointerInBody = Boolean(bodyRect
+    && payload.x >= bodyRect.left && payload.x <= bodyRect.right
+    && payload.y >= bodyRect.top && payload.y <= bodyRect.bottom);
+  const pointerOnApproval = !expanded && pendingCodexApprovals.length > 0 && !pointerInBody;
   if (inIsland) {
     if (hoverCloseTimer !== undefined) {
       window.clearTimeout(hoverCloseTimer);
       hoverCloseTimer = undefined;
     }
-    if (!expanded) setExpanded(true);
+    if (!expanded && !pointerOnApproval) setExpanded(true);
   } else if (!inIsland && wasPointerInNativeIsland && expanded) {
     scheduleClose();
   }
@@ -1891,7 +2241,7 @@ window.addEventListener("storage", (event) => {
   if (event.key === KEYS.pocket) pocketItems = readPocketItems();
   else if (event.key === KEYS.clipboard) clipboardEntries = readClipboardEntries();
   else if (event.key === KEYS.shortcuts) shortcuts = readShortcuts();
-  else if (event.key === KEYS.petName) petName = localStorage.getItem(KEYS.petName) || "Mochi";
+  else if (event.key === KEYS.petName) petName = localStorage.getItem(KEYS.petName) || "Ghosty";
   else if (event.key === KEYS.petSkin) petSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight"], "pearl");
   else if (event.key === KEYS.petAccessory) petAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
   else if (event.key === KEYS.focus) focusState = readFocusState();
@@ -1908,7 +2258,11 @@ window.addEventListener("storage", (event) => {
   if (event.key === KEYS.focus || event.key === KEYS.pocket || event.key === KEYS.petName || event.key === KEYS.petSkin || event.key === KEYS.petAccessory) {
     updatePetAtmosphere();
     app.querySelectorAll<HTMLElement>(".pet-name").forEach((name) => { name.textContent = petName; });
-    app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => pet.setAttribute("aria-label", petName));
+    app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => {
+      pet.setAttribute("aria-label", petName);
+      pet.dataset.skin = petSkin;
+      pet.dataset.accessory = petAccessory;
+    });
   }
   if (event.key === KEYS.pocket) refreshPocketUi();
   else if (event.key === KEYS.clipboard) refreshClipboardUi();

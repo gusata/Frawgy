@@ -175,7 +175,7 @@ fn read_clipboard_text() -> Result<String, String> {
 #[tauri::command]
 fn write_clipboard_text(text: String) -> Result<(), String> {
     if text.len() > 1_000_000 {
-        return Err("o texto é grande demais para a prancheta do Mochi".to_string());
+        return Err("o texto é grande demais para a prancheta do Ghosty".to_string());
     }
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe { OpenClipboard(None) }.map_err(|error| format!("abrir prancheta: {error}"))?;
@@ -442,7 +442,7 @@ fn spawn_cursor_poll(
                         .get(&label)
                         .map_or(true, |last| last.elapsed() >= Duration::from_millis(100));
                 if moved || retry_hover_event {
-                    let _ = app.emit_to(label.as_str(), "edge-mochi-cursor", position);
+                    let _ = app.emit_to(label.as_str(), "edge-ghosty-cursor", position);
                     last_cursor_events.insert(label.clone(), Instant::now());
                 }
             }
@@ -615,7 +615,7 @@ fn ensure_display_windows(app: &AppHandle, count: usize) -> Result<(), String> {
             continue;
         }
         WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
-            .title("Edge Mochi")
+            .title("Edge Ghosty")
             .inner_size(400.0, 720.0)
             .decorations(false)
             .transparent(true)
@@ -709,7 +709,7 @@ async fn apply_display_layout(
         }
     }
     app.emit(
-        "edge-mochi-layout-updated",
+        "edge-ghosty-layout-updated",
         LayoutUpdate {
             edge: match edge {
                 Edge::Left => "left",
@@ -764,9 +764,11 @@ pub fn run() {
             apply_display_layout,
             show_utility_popup,
             codex_hooks::codex_hooks_enabled,
+            codex_hooks::sync_codex_hooks_if_enabled,
             codex_hooks::set_codex_hooks_enabled,
-            codex_hooks::drain_codex_events
+            codex_hooks::drain_codex_events,
+            codex_hooks::resolve_codex_approval
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Edge Mochi");
+        .expect("error while running Edge Ghosty");
 }

@@ -1,3 +1,3 @@
 fn main() {
-    edge_mochi_lib::run();
+    edge_ghosty_lib::run();
 }

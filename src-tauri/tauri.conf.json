@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Edge Mochi",
+  "productName": "Edge Ghosty",
   "version": "0.1.0",
   "identifier": "com.edgemochi.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Edge Mochi",
+        "title": "Edge Ghosty",
         "width": 400,
         "height": 720,
         "decorations": false,
@@ -27,7 +27,7 @@
       },
       {
         "label": "utility-popup",
-        "title": "Edge Mochi",
+        "title": "Edge Ghosty",
         "width": 400,
         "height": 500,
         "decorations": false,

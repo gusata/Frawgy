@@ -1,12 +1,12 @@
 [package]
-name = "edge-mochi"
+name = "edge-ghosty"
 version = "0.1.0"
 description = "A tiny edge menu for Windows"
-authors = ["Edge Mochi"]
+authors = ["Edge Ghosty"]
 edition = "2021"
 
 [lib]
-name = "edge_mochi_lib"
+name = "edge_ghosty_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
