@@ -14,8 +14,15 @@ type FocusState = { durationMs: number; remainingMs: number; endsAt: number; run
 type MediaInfo = { title: string; artist: string; playing: boolean };
 type Edge = "left" | "top" | "bottom";
 type MenuTab = "home" | "pet" | "shortcuts";
-type UtilityPopupMode = "focus" | "pocket" | "customize" | "clipboard";
+type UtilityPopupMode = "focus" | "pocket" | "customize" | "clipboard" | "chat";
 type UtilityPopupPosition = { x: number; y: number };
+type QuickChatMessage = { id: string; role: "user" | "assistant"; text: string; pending?: boolean };
+type QuickChatApproval = { requestId: number | string; method: string; params: Record<string, unknown>; preview?: string };
+type QuickChatReasoning = { reasoningEffort: string; description?: string };
+type QuickChatModel = { id: string; displayName: string; supportedReasoningEfforts: QuickChatReasoning[]; defaultReasoningEffort?: string };
+type QuickChatCatalog = { authenticated: boolean; models: QuickChatModel[] };
+type QuickChatEvent = { method: string; params?: Record<string, unknown>; requestId?: number | string };
+type QuickChatWebsiteRequest = { siteName: string; url: string | null; continuation?: string };
 type DisplayInfo = {
   id: string;
   name: string;
@@ -76,6 +83,10 @@ const KEYS = {
   focus: "edge-ghosty.focus",
   utilityPopup: "edge-ghosty.utility-popup",
   utilityPopupPosition: "edge-ghosty.utility-popup-position",
+  quickChatModel: "edge-ghosty.quick-chat-model",
+  quickChatReasoning: "edge-ghosty.quick-chat-effort",
+  quickChatEntry: "edge-ghosty.quick-chat-entry",
+  quickChatWebsiteCache: "edge-ghosty.quick-chat-website-cache.v1",
 };
 const LEGACY_KEYS = {
   length: "edge-mochi.bar-height",
@@ -93,6 +104,10 @@ const LEGACY_KEYS = {
   focus: "edge-mochi.focus",
   utilityPopup: "edge-mochi.utility-popup",
   utilityPopupPosition: "edge-mochi.utility-popup-position",
+  quickChatModel: "edge-mochi.quick-chat-model",
+  quickChatReasoning: "edge-mochi.quick-chat-effort",
+  quickChatEntry: "edge-mochi.quick-chat-entry",
+  quickChatWebsiteCache: "edge-mochi.quick-chat-website-cache.v1",
 };
 for (const name of Object.keys(KEYS) as Array<keyof typeof KEYS>) {
   const legacyValue = localStorage.getItem(LEGACY_KEYS[name]);
@@ -101,6 +116,83 @@ for (const name of Object.keys(KEYS) as Array<keyof typeof KEYS>) {
   }
 }
 if (localStorage.getItem(KEYS.petName) === "Mochi") localStorage.setItem(KEYS.petName, "Ghosty");
+if (!["focus", "pocket", "customize", "clipboard", "chat"].includes(localStorage.getItem(KEYS.utilityPopup) ?? "")) {
+  localStorage.removeItem(KEYS.utilityPopup);
+}
+const QUICK_CHAT_SITE_CACHE_LIMIT = 256;
+const QUICK_CHAT_SITE_ALIASES: Readonly<Record<string, string>> = {
+  github: "https://github.com",
+  "github com": "https://github.com",
+  youtube: "https://www.youtube.com",
+  "you tube": "https://www.youtube.com",
+  google: "https://www.google.com",
+  reddit: "https://www.reddit.com",
+  wikipedia: "https://www.wikipedia.org",
+  x: "https://x.com",
+  twitter: "https://x.com",
+  instagram: "https://www.instagram.com",
+  linkedin: "https://www.linkedin.com",
+  discord: "https://discord.com/app",
+  twitch: "https://www.twitch.tv",
+  spotify: "https://open.spotify.com",
+  chatgpt: "https://chatgpt.com",
+  gmail: "https://mail.google.com",
+  notion: "https://www.notion.so",
+  stackoverflow: "https://stackoverflow.com",
+};
+
+function normalizeQuickChatSiteName(name: string) {
+  return name.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("pt-BR")
+    .replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function safeQuickChatWebsiteUrl(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    if ((url.protocol !== "https:" && url.protocol !== "http:") || !url.hostname || url.username || url.password) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function readQuickChatWebsiteCache() {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(KEYS.quickChatWebsiteCache) ?? "{}");
+    if (!stored || typeof stored !== "object" || Array.isArray(stored)) return new Map<string, string>();
+    const entries = Object.entries(stored as Record<string, unknown>)
+      .map(([name, url]) => [normalizeQuickChatSiteName(name), safeQuickChatWebsiteUrl(url)] as const)
+      .filter((entry): entry is readonly [string, string] => !!entry[0] && !!entry[1])
+      .slice(-QUICK_CHAT_SITE_CACHE_LIMIT);
+    return new Map(entries);
+  } catch {
+    return new Map<string, string>();
+  }
+}
+
+let quickChatWebsiteCache = readQuickChatWebsiteCache();
+
+function saveQuickChatWebsiteResolution(siteName: string, websiteUrl: string) {
+  const key = normalizeQuickChatSiteName(siteName);
+  const url = safeQuickChatWebsiteUrl(websiteUrl);
+  if (!key || !url) return;
+  const next = new Map(quickChatWebsiteCache);
+  next.delete(key);
+  next.set(key, url);
+  while (next.size > QUICK_CHAT_SITE_CACHE_LIMIT) {
+    const oldest = next.keys().next().value;
+    if (oldest === undefined) break;
+    next.delete(oldest);
+  }
+  quickChatWebsiteCache = next;
+  try {
+    localStorage.setItem(KEYS.quickChatWebsiteCache, JSON.stringify(Object.fromEntries(next)));
+  } catch (error) {
+    console.warn("Não consegui persistir o cache de sites; os próximos acessos desta sessão continuam rápidos.", error);
+  }
+}
+
 const DEFAULTS = {
   length: 80,
   thickness: 10,
@@ -147,6 +239,29 @@ let utilityPopupMode: UtilityPopupMode | null = null;
 let utilityPopupBlurTimer: number | undefined;
 let utilityPopupPositionSaveTimer: number | undefined;
 let latestUtilityPopupPosition: UtilityPopupPosition | null = null;
+let quickChatMessages: QuickChatMessage[] = [];
+let quickChatApprovals: QuickChatApproval[] = [];
+let quickChatApprovalBusy = new Set<string>();
+let quickChatFileChangePreviews = new Map<string, string>();
+let quickChatAutoApproveSession = false;
+let quickChatSessionPermissionNotice = "";
+let quickChatModels: QuickChatModel[] = [{ id: "gpt-6-luna", displayName: "GPT-6 Luna", supportedReasoningEfforts: [{ reasoningEffort: "low" }] }];
+let quickChatAuthenticated = false;
+let quickChatLoading = false;
+let quickChatCancelRequested = false;
+let quickChatServiceLoading = false;
+let quickChatServiceStarted = false;
+let quickChatLoginPending = false;
+let quickChatLoginFailed = false;
+let quickChatLoginCompletedAt = 0;
+let quickChatError = "";
+let quickChatEntryPending = localStorage.getItem(KEYS.utilityPopup) === "chat"
+  && Date.now() - Number(localStorage.getItem(KEYS.quickChatEntry) ?? 0) < 1600;
+let quickChatStickToBottom = true;
+let quickChatStatusPoll: number | undefined;
+let quickChatStatusBusy = false;
+let quickChatSelectedModel = localStorage.getItem(KEYS.quickChatModel) || "gpt-6-luna";
+let quickChatSelectedReasoning = localStorage.getItem(KEYS.quickChatReasoning) || "low";
 let barLength = readNumber(KEYS.length, DEFAULTS.length, MIN_LENGTH, MAX_LENGTH, LENGTH_STEP);
 let barThickness = readNumber(KEYS.thickness, DEFAULTS.thickness, MIN_THICKNESS, MAX_THICKNESS);
 let edge = readEdge();
@@ -655,7 +770,7 @@ function renderPetPage() {
 
 function readUtilityPopupMode(): UtilityPopupMode | null {
   const mode = localStorage.getItem(KEYS.utilityPopup);
-  return mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard" ? mode : null;
+  return mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard" || mode === "chat" ? mode : null;
 }
 
 function readUtilityPopupPosition(): UtilityPopupPosition | null {
@@ -681,7 +796,150 @@ function flushUtilityPopupPosition() {
   }
 }
 
+function quickChatModel(id = quickChatSelectedModel) {
+  return quickChatModels.find((model) => model.id === id) ?? quickChatModels[0];
+}
+
+function quickChatReasoningOptions(model = quickChatModel()) {
+  return model?.supportedReasoningEfforts.length
+    ? model.supportedReasoningEfforts
+    : [{ reasoningEffort: "low" }];
+}
+
+function quickChatSingleHttpUrl(text: string) {
+  const matches = [...text.matchAll(/https?:\/\/[^\s<>"'`]+/gi)];
+  if (matches.length !== 1) return null;
+  let candidate = matches[0][0].replace(/[.,!?;:]+$/, "");
+  for (const [opening, closing] of [["(", ")"], ["[", "]"], ["{", "}"]] as const) {
+    while (candidate.endsWith(closing)
+      && candidate.split(closing).length > candidate.split(opening).length) {
+      candidate = candidate.slice(0, -1);
+    }
+  }
+  return safeQuickChatWebsiteUrl(candidate);
+}
+
+function quickChatMessageHtml(message: QuickChatMessage) {
+  const text = escapeHtml(message.text).replace(/https?:\/\/[^\s<]+/g, (url) =>
+    `<a href="#" data-chat-url="${url}" rel="noreferrer">${url}</a>`);
+  return `<article class="quick-chat-message is-${message.role}" data-message-id="${escapeHtml(message.id)}"><div class="quick-chat-bubble">${text || (message.pending ? '<span class="quick-chat-thinking" aria-label="Ghosty está pensando"><i></i><i></i><i></i></span>' : "")}</div></article>`;
+}
+
+function quickChatApprovalHtml(approval: QuickChatApproval) {
+  const params = approval.params;
+  const isCommand = approval.method === "item/commandExecution/requestApproval";
+  const isFileChange = approval.method === "item/fileChange/requestApproval";
+  const isPermissionRequest = approval.method === "item/permissions/requestApproval";
+  const network = params.networkApprovalContext && typeof params.networkApprovalContext === "object"
+    ? params.networkApprovalContext as Record<string, unknown>
+    : null;
+  const lines: string[] = [];
+  if (typeof params.command === "string") lines.push(`Comando: ${params.command}`);
+  if (params.commandActions !== undefined) lines.push(`Ações do comando: ${JSON.stringify(params.commandActions, null, 2)}`);
+  if (typeof params.cwd === "string") lines.push(`Pasta: ${params.cwd}`);
+  if (typeof params.grantRoot === "string") lines.push(`Pasta solicitada: ${params.grantRoot}`);
+  if (approval.preview) lines.push(`Alterações propostas:\n${approval.preview}`);
+  if (network) lines.push(`Rede: ${String(network.host ?? "destino informado")}${network.protocol ? ` (${String(network.protocol)})` : ""}`);
+  if (params.additionalPermissions !== undefined) lines.push(`Acesso adicional: ${JSON.stringify(params.additionalPermissions, null, 2)}`);
+  if (isPermissionRequest && params.permissions !== undefined) lines.push(`Permissões pedidas: ${JSON.stringify(params.permissions, null, 2)}`);
+  const detail = lines.join("\n") || "O Codex quer realizar uma ação que precisa da sua autorização.";
+  const reason = typeof params.reason === "string" ? params.reason : "";
+  const title = isCommand ? "Autorizar comando" : isFileChange ? "Autorizar alteração de arquivo" : "Autorizar acesso";
+  const busy = quickChatApprovalBusy.has(String(approval.requestId));
+  return `<section class="quick-chat-approval" aria-label="Pedido de permissão">
+    <strong>${title}</strong>
+    ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
+    <pre>${escapeHtml(detail)}</pre>
+    <div class="quick-chat-approval-actions">
+      <button type="button" data-chat-approval="deny" data-request-id="${escapeHtml(String(approval.requestId))}" ${busy ? "disabled" : ""}>Negar</button>
+      <button type="button" data-chat-approval="allow" data-request-id="${escapeHtml(String(approval.requestId))}" ${busy ? "disabled" : ""}>${busy ? "Enviando..." : "Permitir uma vez"}</button>
+      <button type="button" data-chat-approval="session" data-request-id="${escapeHtml(String(approval.requestId))}" ${busy ? "disabled" : ""}>Aprovar tudo nesta sessao</button>
+    </div>
+  </section>`;
+}
+
+function quickChatGrantedPermissions(requested: unknown) {
+  if (!requested || typeof requested !== "object") return {};
+  const source = requested as Record<string, unknown>;
+  const granted: Record<string, unknown> = {};
+  const network = source.network && typeof source.network === "object" ? source.network as Record<string, unknown> : null;
+  if (network?.enabled === true) granted.network = { enabled: true };
+  const fileSystem = source.fileSystem && typeof source.fileSystem === "object" ? source.fileSystem as Record<string, unknown> : null;
+  if (fileSystem) {
+    const fileSystemGrant: Record<string, unknown> = {};
+    for (const key of ["read", "write", "entries"] as const) {
+      const value = fileSystem[key];
+      if (Array.isArray(value) && value.length) fileSystemGrant[key] = value;
+    }
+    if (typeof fileSystem.globScanMaxDepth === "number") fileSystemGrant.globScanMaxDepth = fileSystem.globScanMaxDepth;
+    if (Object.keys(fileSystemGrant).length) granted.fileSystem = fileSystemGrant;
+  }
+  return granted;
+}
+
+function renderQuickChatMessages() {
+  let content = quickChatMessages.map(quickChatMessageHtml).join("");
+  content += quickChatApprovals.map(quickChatApprovalHtml).join("");
+  if (quickChatAutoApproveSession) content += `<div class="quick-chat-session-permission" role="status">Aprovação automática ativa até fechar ou reiniciar este chat.</div>`;
+  else if (quickChatSessionPermissionNotice) content += `<div class="quick-chat-session-permission" role="status">${escapeHtml(quickChatSessionPermissionNotice)}</div>`;
+  if (quickChatLoginPending) {
+    const status = quickChatLoginCompletedAt
+      ? "Login concluído. Confirmando sua conta..."
+      : "Conclua o login do ChatGPT no navegador aberto. Esta janela continuará aberta.";
+    content += `<div class="quick-chat-notice" role="status">${status}</div>`;
+  }
+  if (quickChatError) content += `<div class="quick-chat-notice is-error" role="status">${escapeHtml(quickChatError)}<button type="button" data-action="${quickChatLoginFailed ? "quick-chat-login-retry" : "quick-chat-retry"}">${quickChatLoginFailed ? "Tentar login" : quickChatServiceStarted ? "Tentar de novo" : "Reconectar"}</button></div>`;
+  return content;
+}
+
+function renderQuickChatControls() {
+  const selected = quickChatModel();
+  const reasoning = quickChatReasoningOptions(selected);
+  if (!reasoning.some((option) => option.reasoningEffort === quickChatSelectedReasoning)) {
+    quickChatSelectedReasoning = selected?.defaultReasoningEffort
+      ?? reasoning[0]?.reasoningEffort
+      ?? "low";
+    localStorage.setItem(KEYS.quickChatReasoning, quickChatSelectedReasoning);
+  }
+  const modelOptions = quickChatModels.map((model) =>
+    `<option value="${escapeHtml(model.id)}" ${model.id === quickChatSelectedModel ? "selected" : ""}>${escapeHtml(model.displayName)}</option>`).join("");
+  const reasoningOptions = reasoning.map((option) =>
+    `<option value="${escapeHtml(option.reasoningEffort)}" ${option.reasoningEffort === quickChatSelectedReasoning ? "selected" : ""}>${escapeHtml(option.reasoningEffort)}</option>`).join("");
+  const disabled = quickChatLoading || quickChatServiceLoading || quickChatLoginPending;
+  const sendAction = quickChatLoading ? "quick-chat-cancel" : quickChatAuthenticated ? "quick-chat-send" : "quick-chat-login";
+  const sendLabel = quickChatLoading ? "Interromper resposta" : quickChatAuthenticated ? "Enviar mensagem" : "Conectar ao ChatGPT";
+  const permissionLabel = quickChatAutoApproveSession ? "Desativar aprovação automática" : "Aprovar tudo nesta sessão";
+  const permissionTitle = quickChatAutoApproveSession
+    ? "Desativar aprovação automática. Permissões já concedidas continuam válidas até reiniciar o chat."
+    : "Aprovar todos os pedidos de permissão até fechar ou reiniciar o chat.";
+  return `
+    <label class="quick-chat-select-wrap"><span class="visually-hidden">Modelo</span><select id="quick-chat-model" aria-label="Modelo" ${disabled ? "disabled" : ""}>${modelOptions}</select></label>
+    <label class="quick-chat-select-wrap"><span class="visually-hidden">Raciocínio</span><select id="quick-chat-reasoning" aria-label="Nível de raciocínio" ${disabled ? "disabled" : ""}>${reasoningOptions}</select></label>
+    <button class="quick-chat-session-approval ${quickChatAutoApproveSession ? "is-active" : ""}" type="button" data-action="quick-chat-session-approval" aria-pressed="${quickChatAutoApproveSession}" aria-label="${permissionLabel}" title="${permissionTitle}"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 20 6v5c0 5.2-3.4 8.4-8 10-4.6-1.6-8-4.8-8-10V6l8-3Z"/><path d="m8.5 12 2.2 2.2 4.8-5"/></svg><span class="visually-hidden">${permissionLabel}</span></button>
+    <button class="quick-chat-send ${quickChatLoading ? "is-stop" : ""}" type="button" data-action="${sendAction}" aria-label="${sendLabel}" title="${quickChatLoading ? "Interromper" : quickChatAuthenticated ? "Enviar" : "Conectar ao ChatGPT"}" ${quickChatServiceLoading || quickChatLoginPending ? "disabled" : ""}>${quickChatLoading ? '<span class="quick-chat-stop-icon"></span>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 14 18 2M7 2h11v11"/></svg>'}</button>`;
+}
+
+function paintQuickChatControls() {
+  const controls = app.querySelector<HTMLElement>(".quick-chat-controls");
+  if (!controls) return;
+  controls.innerHTML = renderQuickChatControls();
+}
+
+function renderQuickChat() {
+  const hasConversation = quickChatMessages.length > 0 || quickChatApprovals.length > 0 || !!quickChatError || quickChatLoginPending || quickChatAutoApproveSession || !!quickChatSessionPermissionNotice;
+  return `
+    <section class="quick-chat" data-entering="${quickChatEntryPending}" aria-label="Chat rápido do Ghosty">
+      <div class="quick-chat-thread ${hasConversation ? "is-active" : "is-idle"}" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0"><div class="quick-chat-messages">${renderQuickChatMessages()}</div></div>
+      <div class="quick-chat-pet-mask">${renderPetCharacter("quick-chat-pet")}</div>
+      <form class="quick-chat-composer" data-action="quick-chat-form" autocomplete="off">
+        <input id="quick-chat-input" name="message" type="text" maxlength="8000" aria-label="Mensagem para o Ghosty" ${quickChatLoading || quickChatServiceLoading || quickChatLoginPending ? "disabled" : ""} />
+      </form>
+      <div class="quick-chat-controls">${renderQuickChatControls()}</div>
+    </section>`;
+}
+
 function renderUtilityPopupContent(mode: UtilityPopupMode) {
+  if (mode === "chat") return renderQuickChat();
   if (mode === "focus") {
     const remaining = focusRemainingMs();
     const progress = focusState.durationMs > 0 ? 100 - remaining / focusState.durationMs * 100 : 0;
@@ -725,9 +983,27 @@ function renderUtilityPopupContent(mode: UtilityPopupMode) {
 }
 
 function renderUtilityPopup() {
+  const previousMode = utilityPopupMode;
   utilityPopupMode = readUtilityPopupMode();
+  if (previousMode === "chat" && utilityPopupMode !== "chat") void stopQuickChatSession();
   if (!utilityPopupMode) {
     app.innerHTML = "";
+    return;
+  }
+  if (utilityPopupMode === "chat") {
+    app.innerHTML = `<main class="utility-popup-window quick-chat-window" data-popup="chat">${renderQuickChat()}</main>`;
+    bindUtilityPopup();
+    bindPetInteractions(app);
+    if (quickChatEntryPending) {
+      window.setTimeout(() => {
+        quickChatEntryPending = false;
+        const chat = app.querySelector<HTMLElement>(".quick-chat");
+        chat?.setAttribute("data-entering", "false");
+        app.querySelector<HTMLInputElement>("#quick-chat-input")?.focus();
+      }, 760);
+    }
+    if (!quickChatServiceStarted && !quickChatServiceLoading) void startQuickChatSession();
+    if (quickChatStickToBottom) scrollQuickChatToBottom();
     return;
   }
   const copy: Record<UtilityPopupMode, { title: string; subtitle: string }> = {
@@ -735,6 +1011,7 @@ function renderUtilityPopup() {
     pocket: { title: `Bolso do ${petName}`, subtitle: `${pocketItems.length}/8 itens · os originais ficam no lugar` },
     customize: { title: "Personalizar o Ghosty", subtitle: "Nome, aparência e acessório" },
     clipboard: { title: "Prancheta", subtitle: `${clipboardEntries.length} itens recentes` },
+    chat: { title: "", subtitle: "" },
   };
   const heading = copy[utilityPopupMode];
   app.innerHTML = `
@@ -754,6 +1031,10 @@ function renderUtilityPopup() {
 function bindUtilityPopup() {
   const popup = app.querySelector<HTMLElement>(".utility-popup-window");
   if (!popup) return;
+  if (utilityPopupMode === "chat") {
+    bindQuickChatPopup(popup);
+    return;
+  }
   popup.querySelector("[data-action=popup-close]")?.addEventListener("click", () => void closeUtilityPopup());
   popup.querySelector<HTMLElement>(".utility-popup-drag-handle")?.addEventListener("mousedown", (event) => {
     if (event.button !== 0) return;
@@ -803,9 +1084,573 @@ function bindUtilityPopup() {
   }
 }
 
-async function openUtilityPopup(mode: UtilityPopupMode) {
-  localStorage.setItem(KEYS.utilityPopup, mode);
+function paintQuickChatMessages(forceToBottom = false) {
+  const thread = app.querySelector<HTMLElement>(".quick-chat-thread");
+  const list = app.querySelector<HTMLElement>(".quick-chat-messages");
+  if (!thread || !list) return;
+  const hasConversation = quickChatMessages.length > 0 || quickChatApprovals.length > 0 || !!quickChatError || quickChatLoginPending || quickChatAutoApproveSession || !!quickChatSessionPermissionNotice;
+  const wasAtBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 28;
+  thread.classList.toggle("is-active", hasConversation);
+  thread.classList.toggle("is-idle", !hasConversation);
+  list.innerHTML = renderQuickChatMessages();
+  if (forceToBottom || quickChatStickToBottom && wasAtBottom) thread.scrollTop = thread.scrollHeight;
+}
+
+function scrollQuickChatToBottom() {
+  const thread = app.querySelector<HTMLElement>(".quick-chat-thread");
+  if (thread) thread.scrollTop = thread.scrollHeight;
+}
+
+function setQuickChatPetState(state: PetState, detail = "") {
+  const pet = app.querySelector<HTMLElement>(".quick-chat-pet");
+  const motion = pet ? petMotionEngines.get(pet) : undefined;
+  motion?.setState(state, false, detail);
+}
+
+async function answerQuickChatApproval(approval: QuickChatApproval, allow: boolean, sessionScope = false) {
+  const requestKey = String(approval.requestId);
+  if (quickChatApprovalBusy.has(requestKey)) return;
+  quickChatApprovalBusy.add(requestKey);
+  paintQuickChatMessages();
+  const result = approval.method === "item/permissions/requestApproval"
+    ? { permissions: allow ? quickChatGrantedPermissions(approval.params.permissions) : {}, scope: sessionScope ? "session" : "turn" }
+    : { decision: allow ? sessionScope ? "acceptForSession" : "accept" : "decline" };
   try {
+    await invoke("quick_chat_respond", { requestId: approval.requestId, result });
+    quickChatApprovals = quickChatApprovals.filter((pending) => String(pending.requestId) !== requestKey);
+    quickChatError = "";
+    quickChatApprovalBusy.delete(requestKey);
+    paintQuickChatMessages(true);
+  } catch (error) {
+    quickChatError = `Não consegui responder ao pedido de permissão: ${String(error)}`;
+    quickChatApprovalBusy.delete(requestKey);
+    paintQuickChatMessages();
+  }
+}
+
+function enableQuickChatAutoApproveSession(exceptRequestId?: number | string) {
+  quickChatAutoApproveSession = true;
+  quickChatSessionPermissionNotice = "";
+  paintQuickChatControls();
+  paintQuickChatMessages();
+  quickChatApprovals.slice().forEach((approval) => {
+    if (String(approval.requestId) !== String(exceptRequestId)) void answerQuickChatApproval(approval, true, true);
+  });
+}
+
+function disableQuickChatAutoApproveSession() {
+  quickChatAutoApproveSession = false;
+  quickChatSessionPermissionNotice = "Aprovação automática desligada; permissões já concedidas continuam ativas até reiniciar esta conversa.";
+  paintQuickChatControls();
+  paintQuickChatMessages();
+}
+
+function updateQuickChatSendControl() {
+  const button = app.querySelector<HTMLButtonElement>(".quick-chat-send");
+  if (!button) return;
+  button.classList.toggle("is-stop", quickChatLoading);
+  const sendLabel = quickChatLoading ? "Interromper resposta" : quickChatAuthenticated ? "Enviar mensagem" : "Conectar ao ChatGPT";
+  button.dataset.action = quickChatLoading ? "quick-chat-cancel" : quickChatAuthenticated ? "quick-chat-send" : "quick-chat-login";
+  button.setAttribute("aria-label", sendLabel);
+  button.title = quickChatLoading ? "Interromper" : quickChatAuthenticated ? "Enviar" : "Conectar ao ChatGPT";
+  button.disabled = quickChatServiceLoading || quickChatLoginPending;
+  button.innerHTML = quickChatLoading
+    ? '<span class="quick-chat-stop-icon"></span>'
+    : '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 14 18 2M7 2h11v11"/></svg>';
+  const input = app.querySelector<HTMLInputElement>("#quick-chat-input");
+  if (input) input.disabled = quickChatLoading || quickChatServiceLoading || quickChatLoginPending;
+  app.querySelectorAll<HTMLSelectElement>("#quick-chat-model, #quick-chat-reasoning").forEach((select) => { select.disabled = quickChatLoading || quickChatServiceLoading || quickChatLoginPending; });
+}
+
+function bindQuickChatPopup(popup: HTMLElement) {
+  const thread = popup.querySelector<HTMLElement>(".quick-chat-thread");
+  popup.addEventListener("pointermove", (event) => {
+    const pet = popup.querySelector<HTMLElement>(".quick-chat-pet");
+    const motion = pet ? petMotionEngines.get(pet) : undefined;
+    if (!pet || !motion) return;
+    const rect = pet.getBoundingClientRect();
+    const x = (event.clientX - (rect.left + rect.width / 2)) / Math.max(1, rect.width * 0.55);
+    const y = (event.clientY - (rect.top + rect.height / 2)) / Math.max(1, rect.height * 0.55);
+    motion.lookAt(x, y);
+  });
+  popup.addEventListener("pointerleave", () => {
+    const pet = popup.querySelector<HTMLElement>(".quick-chat-pet");
+    if (pet) petMotionEngines.get(pet)?.lookAt(0, 0);
+  });
+  thread?.addEventListener("scroll", () => {
+    quickChatStickToBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 28;
+  }, { passive: true });
+  thread?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const approvalButton = target?.closest<HTMLButtonElement>("[data-chat-approval]");
+    if (approvalButton) {
+      event.preventDefault();
+      approvalButton.closest<HTMLElement>(".quick-chat-approval")?.querySelectorAll<HTMLButtonElement>("button").forEach((button) => { button.disabled = true; });
+      const approval = quickChatApprovals.find((pending) => String(pending.requestId) === approvalButton.dataset.requestId);
+      const choice = approvalButton.dataset.chatApproval;
+      if (approval && choice === "session") {
+        enableQuickChatAutoApproveSession(approval.requestId);
+        void answerQuickChatApproval(approval, true, true);
+      } else if (approval) void answerQuickChatApproval(approval, choice === "allow");
+      return;
+    }
+    const action = target?.closest<HTMLButtonElement>("[data-action]")?.dataset.action;
+    if (action === "quick-chat-login") void beginQuickChatLogin();
+    else if (action === "quick-chat-login-retry") void beginQuickChatLogin();
+    else if (action === "quick-chat-retry") {
+      quickChatServiceStarted = false;
+      quickChatError = "";
+      void startQuickChatSession();
+    } else {
+      const link = target?.closest<HTMLAnchorElement>("[data-chat-url]");
+      if (!link) return;
+      event.preventDefault();
+      const url = link.dataset.chatUrl ?? "";
+      if (/^https?:\/\//i.test(url)) void invoke("open_targets", { targets: [url] }).catch(() => undefined);
+    }
+  });
+  const form = popup.querySelector<HTMLFormElement>("[data-action=quick-chat-form]");
+  const input = popup.querySelector<HTMLInputElement>("#quick-chat-input");
+  form?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendQuickChatMessage();
+  });
+  input?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendQuickChatMessage();
+    }
+  });
+  popup.querySelector(".quick-chat-controls")?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const permissionMode = target?.closest<HTMLButtonElement>("[data-action=quick-chat-session-approval]");
+    if (permissionMode) {
+      event.preventDefault();
+      if (quickChatAutoApproveSession) disableQuickChatAutoApproveSession();
+      else enableQuickChatAutoApproveSession();
+      return;
+    }
+    if (!target?.closest(".quick-chat-send")) return;
+    if (quickChatLoading) void cancelQuickChatTurn();
+    else if (!quickChatAuthenticated && !(popup.querySelector<HTMLInputElement>("#quick-chat-input")?.value.trim())) void beginQuickChatLogin();
+    else void sendQuickChatMessage();
+  });
+  popup.addEventListener("change", (event) => {
+    const select = event.target instanceof HTMLSelectElement ? event.target : null;
+    if (select?.id === "quick-chat-model") {
+      quickChatSelectedModel = select.value;
+      localStorage.setItem(KEYS.quickChatModel, quickChatSelectedModel);
+      quickChatSelectedReasoning = quickChatModel()?.defaultReasoningEffort
+        ?? quickChatReasoningOptions()[0]?.reasoningEffort
+        ?? "low";
+      localStorage.setItem(KEYS.quickChatReasoning, quickChatSelectedReasoning);
+      paintQuickChatControls();
+      updateQuickChatSendControl();
+    } else if (select?.id === "quick-chat-reasoning") {
+      quickChatSelectedReasoning = select.value;
+      localStorage.setItem(KEYS.quickChatReasoning, quickChatSelectedReasoning);
+    }
+  });
+  if (!quickChatStatusPoll) {
+    quickChatStatusPoll = window.setInterval(() => {
+      if (utilityPopupMode === "chat" && quickChatLoginPending) void refreshQuickChatStatus();
+    }, 1800);
+  }
+}
+
+async function startQuickChatSession() {
+  quickChatServiceLoading = true;
+  quickChatLoginFailed = false;
+  quickChatLoginCompletedAt = 0;
+  quickChatError = "";
+  paintQuickChatMessages();
+  paintQuickChatControls();
+  updateQuickChatSendControl();
+  try {
+    const result = await invoke<QuickChatCatalog>("quick_chat_start");
+    quickChatAuthenticated = result.authenticated;
+    if (Array.isArray(result.models) && result.models.length) quickChatModels = result.models;
+    if (!quickChatModels.some((model) => model.id === quickChatSelectedModel)) {
+      quickChatSelectedModel = quickChatModels.find((model) => model.id === "gpt-6-luna")?.id ?? quickChatModels[0].id;
+      localStorage.setItem(KEYS.quickChatModel, quickChatSelectedModel);
+    }
+    quickChatLoginPending = false;
+    quickChatServiceStarted = true;
+  } catch (error) {
+    quickChatError = `Não consegui iniciar o chat: ${String(error)}`;
+    quickChatServiceStarted = true;
+  } finally {
+    quickChatServiceLoading = false;
+    if (utilityPopupMode === "chat") {
+      paintQuickChatMessages();
+      paintQuickChatControls();
+      updateQuickChatSendControl();
+      if (!quickChatLoginPending) app.querySelector<HTMLInputElement>("#quick-chat-input")?.focus();
+    }
+  }
+}
+
+async function refreshQuickChatStatus() {
+  if (quickChatStatusBusy) return;
+  quickChatStatusBusy = true;
+  try {
+    const result = await invoke<QuickChatCatalog>("quick_chat_status");
+    quickChatAuthenticated = result.authenticated;
+    if (Array.isArray(result.models) && result.models.length) quickChatModels = result.models;
+    if (quickChatAuthenticated) {
+      quickChatLoginPending = false;
+      quickChatLoginFailed = false;
+      quickChatLoginCompletedAt = 0;
+      quickChatError = "";
+    } else if (quickChatLoginCompletedAt && Date.now() - quickChatLoginCompletedAt > 10_000) {
+      quickChatLoginPending = false;
+      quickChatLoginFailed = true;
+      quickChatLoginCompletedAt = 0;
+      quickChatError = "O login terminou, mas o Codex não confirmou sua conta. Tente conectar de novo.";
+    }
+    if (utilityPopupMode === "chat") {
+      paintQuickChatMessages();
+      paintQuickChatControls();
+      updateQuickChatSendControl();
+    }
+  } catch {
+    // O app-server pode reiniciar enquanto o fluxo de login do sistema abre o navegador.
+  } finally {
+    quickChatStatusBusy = false;
+  }
+}
+
+async function beginQuickChatLogin() {
+  if (quickChatLoginPending) return;
+  quickChatLoginPending = true;
+  quickChatLoginFailed = false;
+  quickChatLoginCompletedAt = 0;
+  quickChatError = "";
+  paintQuickChatMessages();
+  updateQuickChatSendControl();
+  try {
+    const result = await invoke<{ authUrl?: string }>("quick_chat_login");
+    if (result.authUrl && /^https:\/\//i.test(result.authUrl)) {
+      await invoke("open_targets", { targets: [result.authUrl] });
+    } else {
+      quickChatError = "O Codex não retornou o endereço de login.";
+      quickChatLoginPending = false;
+      quickChatLoginFailed = true;
+    }
+  } catch (error) {
+    quickChatError = `Não consegui iniciar o login: ${String(error)}`;
+    quickChatLoginPending = false;
+    quickChatLoginFailed = true;
+  }
+  paintQuickChatMessages();
+  updateQuickChatSendControl();
+}
+
+function quickChatExplicitWebsiteUrl(text: string) {
+  return parseQuickChatWebsiteTarget(text)?.url ?? null;
+}
+
+function parseQuickChatWebsiteTarget(text: string): QuickChatWebsiteRequest | null {
+  const query = text.trim();
+  if (!query) return null;
+  if (/^https?:\/\/[^\s]+$/i.test(query)) {
+    const url = safeQuickChatWebsiteUrl(query);
+    if (!url) return null;
+    return { siteName: new URL(url).hostname, url };
+  }
+
+  const normalized = query.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+  const withoutBrowserTail = normalized.replace(/\s+(?:no|na|pelo|in)\s+(?:navegador|browser)[.!?]*$/i, "");
+  const command = withoutBrowserTail.match(/^(?:abre|abra|abrir|acessa|acesse|acessar|ir para|vai para|va para|visita|visite|visitar|open|go to|visit|navigate to)\s+(?:(?:o|a|os|as|the)\s+)?(.+)$/i);
+  if (!command) return null;
+
+  const target = command[1].trim()
+    .replace(/^(?:site|pagina|website)(?:\s+(?:oficial|do|da|de|d[oa]))?\s+/i, "")
+    .replace(/[.!?]+$/, "").trim();
+  if (!target) return null;
+
+  const normalizedName = normalizeQuickChatSiteName(target);
+  const aliasUrl = QUICK_CHAT_SITE_ALIASES[normalizedName];
+  if (aliasUrl) return { siteName: target, url: aliasUrl };
+  const cachedUrl = quickChatWebsiteCache.get(normalizedName);
+  if (cachedUrl) return { siteName: target, url: cachedUrl };
+  if (/^https?:\/\/[^\s]+$/i.test(target)) {
+    const url = safeQuickChatWebsiteUrl(target);
+    return url ? { siteName: target, url } : null;
+  }
+  if (/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d{1,5})?(?:[/?#][^\s]*)?$/i.test(target)) {
+    const url = safeQuickChatWebsiteUrl(`https://${target}`);
+    return url ? { siteName: target, url } : null;
+  }
+  return { siteName: target, url: null };
+}
+
+function quickChatWebsiteRequest(text: string): QuickChatWebsiteRequest | null {
+  const compound = text.trim().match(/^(abre|abra|abrir|acessa|acesse|acessar|ir para|vai para|va para|visita|visite|visitar|open|go to|visit|navigate to)\s+(.+?)\s+(?:e|and)\s+(?:depois\s+)?(pesquise|pesquisar|busque|buscar|procure|procurar|procura|pesquisa|veja|ver|ache|encontre|encontrar|assista|assistir|reproduza|reproduzir|olhe|olhar|abre|abrir|acesse|acessar|search|search for|find|look up|watch|play|open|go to|navigate to)\b([\s\S]*)$/i);
+  if (!compound) return parseQuickChatWebsiteTarget(text);
+  const site = parseQuickChatWebsiteTarget(`${compound[1]} ${compound[2]}`);
+  const continuation = `${compound[3]}${compound[4] ?? ""}`.trim();
+  return site && continuation ? { ...site, continuation } : null;
+}
+
+function quickChatCompoundWebsiteRequest(text: string) {
+  const request = quickChatWebsiteRequest(text);
+  return request?.continuation ? request : null;
+}
+
+function isExplicitQuickChatAction(text: string) {
+  const query = text.trim();
+  if (!query) return false;
+  const websiteRequest = quickChatWebsiteRequest(query);
+  return /^(?:iniciar|começar|abrir) foco$/i.test(query)
+    || shortcuts.some((item) => query.toLocaleLowerCase() === item.name.toLocaleLowerCase()
+      || query.toLocaleLowerCase() === `abrir ${item.name}`.toLocaleLowerCase())
+    || (websiteRequest !== null && !websiteRequest.continuation);
+}
+
+function runExplicitQuickChatAction(text: string) {
+  const query = text.trim();
+  if (!query) return false;
+  if (/^(?:iniciar|começar|abrir) foco$/i.test(query)) {
+    if (!focusState.running) startFocus();
+    void openUtilityPopup("focus");
+    quickChatMessages.push({ id: makeId(), role: "assistant", text: "Abri seu temporizador de foco." });
+    return true;
+  }
+  const shortcut = shortcuts.find((item) => query.toLocaleLowerCase() === item.name.toLocaleLowerCase()
+    || query.toLocaleLowerCase() === `abrir ${item.name}`.toLocaleLowerCase());
+  if (shortcut) {
+    launchShortcut(shortcut);
+    quickChatMessages.push({ id: makeId(), role: "assistant", text: `Abri ${shortcut.name}.` });
+    return true;
+  }
+  const websiteUrl = quickChatExplicitWebsiteUrl(query);
+  if (websiteUrl) {
+    void invoke("open_targets", { targets: [websiteUrl] }).catch(() => undefined);
+    quickChatMessages.push({ id: makeId(), role: "assistant", text: `Abri ${websiteUrl}` });
+    return true;
+  }
+  return false;
+}
+
+function quickChatWebsiteResolverChoice() {
+  const model = quickChatModels.find((entry) => entry.id === "gpt-6-luna")
+    ?? quickChatModels.find((entry) => entry.id === quickChatSelectedModel)
+    ?? quickChatModels[0];
+  if (!model) return { model: "gpt-6-luna", effort: "low" };
+  const efforts = model.supportedReasoningEfforts.map((entry) => entry.reasoningEffort);
+  const effort = efforts.includes("low")
+    ? "low"
+    : model.defaultReasoningEffort && efforts.includes(model.defaultReasoningEffort)
+      ? model.defaultReasoningEffort
+      : efforts[0] ?? "low";
+  return { model: model.id, effort };
+}
+
+function quickChatWebsiteSearchUrl(siteName: string) {
+  const url = new URL("https://www.google.com/search");
+  url.searchParams.set("q", `${siteName} site oficial`);
+  return url.toString();
+}
+
+async function resolveAndOpenQuickChatWebsite(request: QuickChatWebsiteRequest, pending: QuickChatMessage) {
+  let websiteUrl: string | null = null;
+  let lookupFailed = false;
+  if (quickChatAuthenticated && quickChatServiceStarted) {
+    const choice = quickChatWebsiteResolverChoice();
+    try {
+      const resolved = await invoke<string | null>("quick_chat_resolve_website", {
+        siteName: request.siteName,
+        model: choice.model,
+        effort: choice.effort,
+      });
+      websiteUrl = safeQuickChatWebsiteUrl(resolved);
+    } catch (error) {
+      lookupFailed = true;
+      console.warn("Não consegui resolver o endereço do site pelo Codex", error);
+    }
+  } else {
+    lookupFailed = true;
+  }
+
+  if (quickChatCancelRequested) {
+    pending.text = "Busca interrompida.";
+    pending.pending = false;
+    return null;
+  }
+
+  if (websiteUrl) {
+    try {
+      await invoke("open_targets", { targets: [websiteUrl] });
+      saveQuickChatWebsiteResolution(request.siteName, websiteUrl);
+      pending.text = `Encontrei e abri ${new URL(websiteUrl).hostname}. Vou abrir direto nas próximas vezes.`;
+      pending.pending = false;
+      return websiteUrl;
+    } catch (error) {
+      console.warn("Não consegui abrir o site resolvido", error);
+      lookupFailed = true;
+    }
+  }
+
+  try {
+    await invoke("open_targets", { targets: [quickChatWebsiteSearchUrl(request.siteName)] });
+    pending.text = lookupFailed
+      ? `Não consegui confirmar o endereço de ${request.siteName}. Abri uma busca para você escolher.`
+      : `Não encontrei um site oficial inequívoco para ${request.siteName}. Abri uma busca para você escolher.`;
+  } catch (error) {
+    pending.text = `Não consegui abrir uma busca por ${request.siteName}: ${String(error)}`;
+  }
+  pending.pending = false;
+  return null;
+}
+
+async function sendQuickChatModelMessage(messageForModel: string) {
+  quickChatLoading = true;
+  quickChatCancelRequested = false;
+  quickChatError = "";
+  quickChatMessages.push({ id: makeId(), role: "assistant", text: "", pending: true });
+  quickChatStickToBottom = true;
+  paintQuickChatMessages(true);
+  updateQuickChatSendControl();
+  setQuickChatPetState("thinking");
+  try {
+    await invoke("quick_chat_send", {
+      message: messageForModel,
+      model: quickChatSelectedModel,
+      effort: quickChatSelectedReasoning,
+    });
+  } catch (error) {
+    const pending = quickChatMessages.at(-1);
+    if (pending?.role === "assistant" && pending.pending) {
+      pending.text = `Não consegui enviar: ${String(error)}`;
+      pending.pending = false;
+    }
+    quickChatLoading = false;
+    paintQuickChatMessages(true);
+    updateQuickChatSendControl();
+    setQuickChatPetState("error", String(error));
+  }
+}
+
+async function sendQuickChatMessage() {
+  if (quickChatLoading) return;
+  const input = app.querySelector<HTMLInputElement>("#quick-chat-input");
+  const message = input?.value.trim() ?? "";
+  if (!message) return;
+  const websiteRequest = quickChatWebsiteRequest(message);
+  const websiteFollowUp = websiteRequest?.continuation ? websiteRequest : null;
+  if (!quickChatAuthenticated && !isExplicitQuickChatAction(message)) {
+    if (quickChatServiceStarted) void beginQuickChatLogin();
+    else {
+      quickChatError = "A conexão do chat ainda não está disponível.";
+      paintQuickChatMessages();
+    }
+    return;
+  }
+  if (input) input.value = "";
+  quickChatMessages.push({ id: makeId(), role: "user", text: message });
+  if (runExplicitQuickChatAction(message)) {
+    quickChatError = "";
+    quickChatStickToBottom = true;
+    paintQuickChatMessages(true);
+    setQuickChatPetState("finished");
+    return;
+  }
+
+  if (websiteRequest && !websiteRequest.url) {
+    quickChatLoading = true;
+    quickChatCancelRequested = false;
+    quickChatError = "";
+    const pending: QuickChatMessage = {
+      id: makeId(),
+      role: "assistant",
+      text: `Procurando o site oficial de ${websiteRequest.siteName}…`,
+      pending: true,
+    };
+    quickChatMessages.push(pending);
+    quickChatStickToBottom = true;
+    paintQuickChatMessages(true);
+    updateQuickChatSendControl();
+    setQuickChatPetState("searching");
+    const resolvedUrl = await resolveAndOpenQuickChatWebsite(websiteRequest, pending);
+    if (quickChatCancelRequested) {
+      quickChatLoading = false;
+      quickChatCancelRequested = false;
+      paintQuickChatMessages(true);
+      updateQuickChatSendControl();
+      setQuickChatPetState("idle");
+      return;
+    }
+    if (websiteRequest.continuation && quickChatAuthenticated) {
+      const openedContext = resolvedUrl
+        ? `O Ghosty abriu ${resolvedUrl}.`
+        : `O Ghosty não conseguiu confirmar ${websiteRequest.siteName} e abriu uma busca para você escolher.`;
+      await sendQuickChatModelMessage(`A parte restante do pedido é: ${websiteRequest.continuation}\n\n${openedContext} Continue sem repetir a abertura.`);
+      return;
+    }
+    quickChatLoading = false;
+    paintQuickChatMessages(true);
+    updateQuickChatSendControl();
+    setQuickChatPetState("finished");
+    return;
+  }
+
+  let messageForModel = message;
+  if (websiteFollowUp?.url) {
+    void invoke("open_targets", { targets: [websiteFollowUp.url] }).catch(() => undefined);
+    quickChatMessages.push({ id: makeId(), role: "assistant", text: `Abri ${websiteFollowUp.url}.` });
+    messageForModel = `A parte restante do pedido é: ${websiteFollowUp.continuation}\n\nO Ghosty já iniciou a abertura de ${websiteFollowUp.url} no navegador. Continue sem repetir essa ação.`;
+  }
+  await sendQuickChatModelMessage(messageForModel);
+}
+
+async function cancelQuickChatTurn() {
+  quickChatCancelRequested = true;
+  try {
+    await invoke("quick_chat_cancel");
+  } catch (error) {
+    quickChatCancelRequested = false;
+    console.error("Não consegui interromper a resposta do Ghosty", error);
+  }
+}
+
+async function stopQuickChatSession() {
+  if (quickChatStatusPoll !== undefined) {
+    window.clearInterval(quickChatStatusPoll);
+    quickChatStatusPoll = undefined;
+  }
+  if (quickChatServiceStarted || quickChatServiceLoading) await invoke("quick_chat_close").catch(() => undefined);
+  quickChatMessages = [];
+  quickChatApprovals = [];
+  quickChatCancelRequested = false;
+  quickChatApprovalBusy.clear();
+  quickChatFileChangePreviews.clear();
+  quickChatAutoApproveSession = false;
+  quickChatSessionPermissionNotice = "";
+  quickChatAuthenticated = false;
+  quickChatLoading = false;
+  quickChatServiceLoading = false;
+  quickChatServiceStarted = false;
+  quickChatLoginPending = false;
+  quickChatLoginFailed = false;
+  quickChatLoginCompletedAt = 0;
+  quickChatStatusBusy = false;
+  quickChatError = "";
+  quickChatStickToBottom = true;
+}
+
+async function openUtilityPopup(mode: UtilityPopupMode) {
+  if (mode === "chat") {
+    quickChatEntryPending = true;
+    localStorage.setItem(KEYS.quickChatEntry, String(Date.now()));
+  }
+  localStorage.setItem(KEYS.utilityPopup, mode);
+  if (getCurrentWindow().label === "utility-popup") renderUtilityPopup();
+  try {
+    if (mode === "chat") {
+      await invoke("show_quick_chat");
+      return;
+    }
     const position = readUtilityPopupPosition();
     await invoke("show_utility_popup", {
       positionX: position?.x ?? null,
@@ -818,6 +1663,7 @@ async function openUtilityPopup(mode: UtilityPopupMode) {
 
 async function closeUtilityPopup() {
   flushUtilityPopupPosition();
+  if (utilityPopupMode === "chat") await stopQuickChatSession();
   utilityPopupMode = null;
   localStorage.removeItem(KEYS.utilityPopup);
   renderUtilityPopup();
@@ -828,6 +1674,7 @@ function startUtilityPopupWindow() {
   renderUtilityPopup();
   const currentWindow = getCurrentWindow();
   void currentWindow.onMoved(({ payload }) => {
+    if (utilityPopupMode === "chat") return;
     latestUtilityPopupPosition = { x: payload.x, y: payload.y };
     if (utilityPopupPositionSaveTimer !== undefined) window.clearTimeout(utilityPopupPositionSaveTimer);
     utilityPopupPositionSaveTimer = window.setTimeout(flushUtilityPopupPosition, 160);
@@ -839,15 +1686,27 @@ function startUtilityPopupWindow() {
       return;
     }
     if (utilityPopupBlurTimer !== undefined) window.clearTimeout(utilityPopupBlurTimer);
+    const keepChatOpenForPendingWork = utilityPopupMode === "chat"
+      && (quickChatLoginPending || quickChatLoading || quickChatApprovals.length > 0);
     utilityPopupBlurTimer = window.setTimeout(() => {
       utilityPopupBlurTimer = undefined;
       void currentWindow.isFocused().then((stillFocused) => {
-        if (!stillFocused && utilityPopupMode) void closeUtilityPopup();
+        if (!stillFocused && utilityPopupMode && !keepChatOpenForPendingWork) void closeUtilityPopup();
       }).catch(() => undefined);
     }, 160);
   });
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && utilityPopupMode) void closeUtilityPopup();
+    if (utilityPopupMode === "chat" && event.ctrlKey && event.key.toLowerCase() === "n") {
+      event.preventDefault();
+      void stopQuickChatSession().then(() => {
+        quickChatMessages = [];
+        quickChatError = "";
+        quickChatServiceStarted = false;
+        quickChatEntryPending = false;
+        renderUtilityPopup();
+      });
+    }
   });
   void bindNativeFileDrop();
 }
@@ -1564,6 +2423,7 @@ function bindPocketDropzone(dropzone: HTMLElement) {
 async function bindNativeFileDrop() {
   try {
     await getCurrentWindow().onDragDropEvent(async (event) => {
+      if (getCurrentWindow().label === "utility-popup" && utilityPopupMode === "chat") return;
       if (event.payload.type === "enter") {
         pocketDropActive = true;
         const utilityPopup = getCurrentWindow().label === "utility-popup";
@@ -1904,7 +2764,7 @@ function renderSettingsContent() {
         </section>
         <section class="control-card setting-card codex-integration-card">
           <div class="setting-heading">Ghosty e Codex</div>
-          <p class="codex-integration-copy">Nas sessões locais do Codex, as bolinhas indicam atividade e o Ghosty mostra pedidos de aprovação e conclusões. A descrição resumida da ação pendente fica na fila local só até você decidir; texto do chat e resultados de ferramentas não são guardados nem enviados.</p>
+          <p class="codex-integration-copy">Nas sessões locais do Codex, as bolinhas indicam atividade e o Ghosty mostra pedidos de aprovação e conclusões. Os hooks não capturam prompts, respostas ou resultados de ferramentas.</p>
           <small class="codex-integration-status" id="codex-hooks-status" role="status">${escapeHtml(codexHooksStatusMessage)}</small>
           <button class="reset-button codex-integration-toggle" id="codex-hooks-toggle" type="button" ${codexHooksBusy ? "disabled" : ""}>${codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex"}</button>
         </section>
@@ -2036,7 +2896,7 @@ function render() {
             </div>
           </header>
           <main class="tab-view" role="tabpanel">${renderActiveTab()}</main>
-          <footer><span>Ctrl + Space</span><span class="footer-hint">encoste na barrinha</span></footer>
+          <footer><span>Ctrl + Shift + Espaço</span><span class="footer-hint">chat rápido do Ghosty</span></footer>
         </div>
         <div class="ghosty-inline-approval" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ghosty-inline-approval-title">
           ${renderPetCharacter("ghosty-inline-approval-pet")}
@@ -2222,14 +3082,157 @@ void listen<CursorPosition>("edge-ghosty-cursor", ({ payload }) => {
 });
 
 const currentWindowLabel = getCurrentWindow().label;
+void listen<QuickChatEvent>("edge-ghosty-quick-chat-event", ({ payload }) => {
+  if (utilityPopupMode !== "chat") return;
+  const params = payload.params ?? {};
+  if (payload.method === "item/started") {
+    const item = params.item && typeof params.item === "object" ? params.item as Record<string, unknown> : {};
+    if (item.type === "fileChange" && typeof item.id === "string" && Array.isArray(item.changes)) {
+      const preview = item.changes.map((change) => {
+        if (!change || typeof change !== "object") return "";
+        const entry = change as Record<string, unknown>;
+        return [entry.kind, entry.path, entry.diff].filter((part) => typeof part === "string" && part).join("\n");
+      }).filter(Boolean).join("\n\n").slice(0, 12_000);
+      quickChatFileChangePreviews.set(item.id, preview);
+    }
+    return;
+  }
+  if (payload.method === "item/completed") {
+    const item = params.item && typeof params.item === "object" ? params.item as Record<string, unknown> : {};
+    if (typeof item.id === "string") quickChatFileChangePreviews.delete(item.id);
+  }
+  if (payload.requestId !== undefined && [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+  ].includes(payload.method)) {
+    const approval = {
+      requestId: payload.requestId,
+      method: payload.method,
+      params,
+      preview: payload.method === "item/fileChange/requestApproval" && typeof params.itemId === "string"
+        ? quickChatFileChangePreviews.get(params.itemId)
+        : undefined,
+    };
+    quickChatApprovals = [...quickChatApprovals.filter((pending) => String(pending.requestId) !== String(approval.requestId)), approval];
+    paintQuickChatMessages(true);
+    setQuickChatPetState("approval");
+    if (quickChatAutoApproveSession) void answerQuickChatApproval(approval, true, true);
+    return;
+  }
+  if (payload.method === "serverRequest/resolved" && params.requestId !== undefined) {
+    quickChatApprovals = quickChatApprovals.filter((pending) => String(pending.requestId) !== String(params.requestId));
+    quickChatApprovalBusy.delete(String(params.requestId));
+    paintQuickChatMessages();
+    return;
+  }
+  if (payload.method === "server/disconnected") {
+    quickChatServiceStarted = false;
+    quickChatAuthenticated = false;
+    quickChatCancelRequested = false;
+    quickChatApprovals = [];
+    quickChatApprovalBusy.clear();
+    quickChatFileChangePreviews.clear();
+    quickChatAutoApproveSession = false;
+    quickChatSessionPermissionNotice = "";
+    quickChatLoginPending = false;
+    quickChatLoginCompletedAt = 0;
+    if (quickChatLoading) {
+      const pending = [...quickChatMessages].reverse().find((message) => message.role === "assistant" && message.pending);
+      if (pending) {
+        pending.pending = false;
+        pending.text = "A conexão com o Codex foi encerrada. Tente novamente.";
+      }
+      quickChatLoading = false;
+      paintQuickChatMessages(true);
+      updateQuickChatSendControl();
+      setQuickChatPetState("error");
+    } else {
+      quickChatError = "A conexão com o Codex foi encerrada.";
+      paintQuickChatMessages();
+    }
+    return;
+  }
+  if (payload.method === "item/agentMessage/delta") {
+    const delta = typeof params.delta === "string" ? params.delta : "";
+    if (!delta) return;
+    const pending = [...quickChatMessages].reverse().find((message) => message.role === "assistant" && message.pending);
+    if (!pending) return;
+    pending.text += delta;
+    paintQuickChatMessages();
+    return;
+  }
+  if (payload.method === "turn/completed") {
+    const turn = params.turn && typeof params.turn === "object" ? params.turn as Record<string, unknown> : {};
+    const status = String(turn.status ?? params.status ?? "completed");
+    const pending = [...quickChatMessages].reverse().find((message) => message.role === "assistant" && message.pending);
+    const linkToOpen = pending && status === "completed" && !quickChatCancelRequested
+      ? quickChatSingleHttpUrl(pending.text)
+      : null;
+    if (pending) {
+      pending.pending = false;
+      if (status !== "completed" && !pending.text) pending.text = `A resposta terminou com o estado “${status}”.`;
+    }
+    quickChatLoading = false;
+    quickChatCancelRequested = false;
+    paintQuickChatMessages(true);
+    updateQuickChatSendControl();
+    setQuickChatPetState(status === "completed" ? "finished" : "error", status);
+    if (linkToOpen) {
+      void invoke("open_targets", { targets: [linkToOpen] }).catch((error) => {
+        console.warn("Não consegui abrir automaticamente o link da resposta do Ghosty.", error);
+      });
+    }
+    return;
+  }
+  if (payload.method === "account/login/completed") {
+    const success = params.success === true;
+    if (success) {
+      quickChatLoginFailed = false;
+      quickChatLoginCompletedAt = Date.now();
+      quickChatError = "";
+      void refreshQuickChatStatus();
+    } else {
+      quickChatLoginPending = false;
+      quickChatLoginFailed = true;
+      quickChatLoginCompletedAt = 0;
+      quickChatError = typeof params.error === "string" && params.error
+        ? `Login não concluído: ${params.error}`
+        : "Login não concluído. Você pode tentar novamente.";
+      paintQuickChatMessages();
+      paintQuickChatControls();
+      updateQuickChatSendControl();
+    }
+    return;
+  }
+  if (payload.method === "account/updated") {
+    void refreshQuickChatStatus();
+  }
+});
+if (currentWindowLabel === "main") {
+  void listen("edge-ghosty-quick-chat", () => { void openUtilityPopup("chat"); });
+}
 if (currentWindowLabel === "utility-popup") window.setInterval(() => {
   if (utilityPopupMode === "focus") paintFocusTimer();
 }, 250);
 else window.setInterval(tickFeatures, 1000);
 
 window.addEventListener("storage", (event) => {
+  if (event.key === KEYS.quickChatWebsiteCache) {
+    quickChatWebsiteCache = readQuickChatWebsiteCache();
+    return;
+  }
+  if (event.key === KEYS.quickChatEntry) {
+    if (currentWindowLabel === "utility-popup" && localStorage.getItem(KEYS.utilityPopup) === "chat") {
+      quickChatEntryPending = Date.now() - Number(localStorage.getItem(KEYS.quickChatEntry) ?? 0) < 1600;
+      if (quickChatEntryPending) renderUtilityPopup();
+    }
+    return;
+  }
   if (event.key === KEYS.utilityPopup) {
     if (currentWindowLabel === "utility-popup") {
+      quickChatEntryPending = localStorage.getItem(KEYS.utilityPopup) === "chat"
+        && Date.now() - Number(localStorage.getItem(KEYS.quickChatEntry) ?? 0) < 1600;
       renderUtilityPopup();
       if (utilityPopupMode && utilityPopupBlurTimer !== undefined) {
         window.clearTimeout(utilityPopupBlurTimer);
@@ -2251,7 +3254,10 @@ window.addEventListener("storage", (event) => {
     if (event.key === KEYS.focus) paintFocusTimer();
     else if (event.key === KEYS.pocket) refreshPocketUi();
     else if (event.key === KEYS.clipboard) refreshClipboardUi();
-    else if ([KEYS.petName, KEYS.petSkin, KEYS.petAccessory].includes(event.key)) renderUtilityPopup();
+    else if ([KEYS.petName, KEYS.petSkin, KEYS.petAccessory].includes(event.key)) {
+      if (utilityPopupMode === "chat") updatePetAtmosphere();
+      else renderUtilityPopup();
+    }
     return;
   }
 

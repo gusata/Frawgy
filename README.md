@@ -13,6 +13,7 @@ Um painel rápido para Windows, inspirado na ilha do Coucou. O Edge Ghosty fica 
 - Pet personalizável com nome, aparência e acessório. O painel de vidro muda de cor suavemente conforme o humor e o item guardado.
 - Abas Home, Pet e Atalhos em três botões compactos no cabeçalho.
 - Nas sessões locais do Codex, as bolinhas pulsam durante tarefas e Ghosty salta para comemorar quando uma tarefa termina.
+- Chat rápido do Ghosty em `Ctrl + Shift + Espaço`, com seleção de modelo e nível de raciocínio; `Ctrl + N` inicia outra conversa. A conversa fica apenas enquanto o popup está aberto, e a conta usa o perfil OAuth isolado do Codex em modo somente leitura.
 
 As preferências, atalhos, histórico de texto e itens do Bolso ficam no armazenamento local do WebView. A leitura da prancheta acontece quando você escolhe capturar; o app não coleta cada cópia em segundo plano.
 

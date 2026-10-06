@@ -28,8 +28,8 @@
       {
         "label": "utility-popup",
         "title": "Edge Ghosty",
-        "width": 400,
-        "height": 500,
+        "width": 560,
+        "height": 472,
         "decorations": false,
         "transparent": true,
         "shadow": false,

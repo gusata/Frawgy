@@ -33,6 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 mod codex_hooks;
+mod codex_chat;
+mod quick_chat_hotkey;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -546,12 +548,26 @@ fn show_utility_popup(
     position_x: Option<i32>,
     position_y: Option<i32>,
 ) -> Result<(), String> {
+    place_utility_popup(&app, &window, position_x.zip(position_y), false)
+}
+
+#[tauri::command]
+fn show_quick_chat(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
+    place_utility_popup(&app, &window, None, true)
+}
+
+fn place_utility_popup(
+    app: &AppHandle,
+    window: &WebviewWindow,
+    saved_position: Option<(i32, i32)>,
+    quick_chat: bool,
+) -> Result<(), String> {
     let fallback_monitor = window
         .current_monitor()
         .map_err(|error| error.to_string())?
         .or_else(|| app.primary_monitor().ok().flatten())
         .ok_or_else(|| "nenhum monitor disponÃ­vel para o popup".to_string())?;
-    let saved_position = position_x.zip(position_y);
+    let saved_position = if quick_chat { None } else { saved_position };
     let monitor = saved_position
         .and_then(|(x, y)| {
             app.available_monitors().ok()?.into_iter().find(|monitor| {
@@ -571,8 +587,16 @@ fn show_utility_popup(
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let scale = monitor.scale_factor();
-    let logical_width = (f64::from(monitor_size.width) / scale - 32.0).clamp(240.0, 400.0);
-    let logical_height = (f64::from(monitor_size.height) / scale - 32.0).clamp(300.0, 500.0);
+    let logical_width = if quick_chat {
+        (f64::from(monitor_size.width) / scale - 32.0).clamp(320.0, 560.0)
+    } else {
+        (f64::from(monitor_size.width) / scale - 32.0).clamp(240.0, 400.0)
+    };
+    let logical_height = if quick_chat {
+        (f64::from(monitor_size.height) / scale - 104.0).clamp(260.0, 472.0)
+    } else {
+        (f64::from(monitor_size.height) / scale - 32.0).clamp(300.0, 500.0)
+    };
     let size = PhysicalSize::new(
         logical_to_physical(logical_width.round() as u32, scale),
         logical_to_physical(logical_height.round() as u32, scale),
@@ -589,7 +613,12 @@ fn show_utility_popup(
         .max(monitor_position.y);
     let centered_x = monitor_position.x + monitor_size.width.saturating_sub(size.width) as i32 / 2;
     let centered_y = monitor_position.y + monitor_size.height.saturating_sub(size.height) as i32 / 2;
-    let (desired_x, desired_y) = saved_position.unwrap_or((centered_x, centered_y));
+    let chat_bottom_gap = logical_to_physical(72, scale) as i32;
+    let chat_y = monitor_position.y
+        .saturating_add(monitor_size.height as i32)
+        .saturating_sub(size.height as i32)
+        .saturating_sub(chat_bottom_gap);
+    let (desired_x, desired_y) = saved_position.unwrap_or((centered_x, if quick_chat { chat_y } else { centered_y }));
     let position = PhysicalPosition::new(
         desired_x.clamp(monitor_position.x, max_x),
         desired_y.clamp(monitor_position.y, max_y),
@@ -734,7 +763,9 @@ async fn apply_display_layout(
 pub fn run() {
     tauri::Builder::default()
         .manage(CursorState::default())
+        .manage(codex_chat::CodexChatState::default())
         .setup(|app| {
+            quick_chat_hotkey::start(app.handle().clone());
             let cursor_state = app.state::<CursorState>();
             spawn_cursor_poll(
                 app.handle().clone(),
@@ -763,6 +794,15 @@ pub fn run() {
             set_island_rect,
             apply_display_layout,
             show_utility_popup,
+            show_quick_chat,
+            codex_chat::quick_chat_start,
+            codex_chat::quick_chat_status,
+            codex_chat::quick_chat_login,
+            codex_chat::quick_chat_send,
+            codex_chat::quick_chat_resolve_website,
+            codex_chat::quick_chat_cancel,
+            codex_chat::quick_chat_respond,
+            codex_chat::quick_chat_close,
             codex_hooks::codex_hooks_enabled,
             codex_hooks::sync_codex_hooks_if_enabled,
             codex_hooks::set_codex_hooks_enabled,
