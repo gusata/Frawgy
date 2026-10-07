@@ -116,6 +116,7 @@ try {
   $occurredAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $toolName = $null
   $agentType = $null
+  $sessionId = $null
   $approvalId = $null
   $approvalDescription = $null
   $approvalExpiresAt = $null
@@ -126,6 +127,10 @@ try {
   if ($payload.agent_type) {
     $rawAgentType = [string]$payload.agent_type
     $agentType = $rawAgentType.Substring(0, [Math]::Min(48, $rawAgentType.Length))
+  }
+  if ($payload.session_id) {
+    $rawSessionId = [string]$payload.session_id
+    $sessionId = $rawSessionId.Substring(0, [Math]::Min(80, $rawSessionId.Length))
   }
 
   if ($eventName -eq "PermissionRequest") {
@@ -141,6 +146,7 @@ try {
     occurredAt = $occurredAt
     toolName = $toolName
     agentType = $agentType
+    sessionId = $sessionId
     approvalId = $approvalId
     approvalDescription = $approvalDescription
     approvalExpiresAt = $approvalExpiresAt

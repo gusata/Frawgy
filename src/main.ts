@@ -4,17 +4,19 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Tracked } from "./anim";
 import { PetMotionEngine, type PetState } from "./pet-motion";
+import { playGhostySound, setGhostySoundEnabled, setGhostySoundVolume } from "./sounds";
 
 type Shortcut = { id: string; name: string; glyph: string; targets: string[]; action?: "focus"; custom?: boolean };
 type PocketItem = { id: string; name: string; kind: "file" | "image" | "text"; value: string; addedAt: number; truncated?: boolean };
 type ClipboardEntry = { id: string; text: string; addedAt: number; pinned?: boolean };
-type PetSkin = "pearl" | "smoke" | "midnight";
-type PetAccessory = "none" | "star" | "bow";
-type FocusState = { durationMs: number; remainingMs: number; endsAt: number; running: boolean };
+type PetSkin = "pearl" | "smoke" | "midnight" | "mint" | "coral" | "lavender";
+type PetAccessory = "none" | "star" | "bow" | "halo" | "leaf" | "crown";
+type FocusState = { durationMs: number; remainingMs: number; endsAt: number; running: boolean; startedAt: number };
+type FocusHistoryEntry = { id: string; startedAt: number; endedAt: number; durationMs: number; completed: boolean };
 type MediaInfo = { title: string; artist: string; playing: boolean };
 type Edge = "left" | "top" | "bottom";
 type MenuTab = "home" | "pet" | "shortcuts";
-type UtilityPopupMode = "focus" | "pocket" | "customize" | "clipboard" | "chat";
+type UtilityPopupMode = "focus" | "focus-summary" | "codex-activity" | "pocket" | "customize" | "clipboard" | "chat";
 type UtilityPopupPosition = { x: number; y: number };
 type QuickChatMessage = { id: string; role: "user" | "assistant"; text: string; pending?: boolean };
 type QuickChatApproval = { requestId: number | string; method: string; params: Record<string, unknown>; preview?: string };
@@ -50,9 +52,18 @@ type CodexHookEvent = {
   approvalId: string | null;
   approvalDescription: string | null;
   approvalExpiresAt: number | null;
+  sessionId?: string | null;
 };
 type CodexApproval = { requestId: string; toolName: string; description: string; expiresAt: number };
 type CodexApprovalDecision = "allow" | "deny";
+type CodexActivityDay = { sessions: number; completed: number; interrupted: number; toolCalls: number; approvals: number; activeMs: number };
+type CodexActivity = Record<string, CodexActivityDay>;
+type CodexRecentActivity = { eventName: string; occurredAt: number; toolName: string | null; agentType: string | null };
+type GithubPullRequest = { title: string; repository: string; number: number; url: string; draft: boolean; ciStatus: string | null };
+type GithubSnapshot = { login: string; checkedAt: number; authored: GithubPullRequest[]; reviewRequested: GithubPullRequest[] };
+type VercelDeployment = { id: string; name: string; url: string; state: string; target: string | null; branch: string | null; commitMessage: string | null; createdAt: number };
+type VercelSnapshot = { username: string; checkedAt: number; deployments: VercelDeployment[] };
+type CodexHookPreview = { enabled: boolean; configPath: string; fingerprint: string; configChanged: boolean; backupWillBeCreated: boolean; changes: Array<{ eventName: string; before: unknown[]; after: unknown[] }> };
 
 const DEFAULT_SHORTCUTS: Shortcut[] = [
   { id: "terminal", name: "Terminal", glyph: "⌘", targets: ["wt.exe"] },
@@ -81,12 +92,19 @@ const KEYS = {
   petSkin: "edge-ghosty.pet-skin",
   petAccessory: "edge-ghosty.pet-accessory",
   focus: "edge-ghosty.focus",
+  focusHistory: "edge-ghosty.focus-history",
+  onboardingComplete: "edge-ghosty.onboarding-complete",
   utilityPopup: "edge-ghosty.utility-popup",
   utilityPopupPosition: "edge-ghosty.utility-popup-position",
   quickChatModel: "edge-ghosty.quick-chat-model",
   quickChatReasoning: "edge-ghosty.quick-chat-effort",
   quickChatEntry: "edge-ghosty.quick-chat-entry",
   quickChatWebsiteCache: "edge-ghosty.quick-chat-website-cache.v1",
+  quickChatDraft: "edge-ghosty.quick-chat-draft",
+  codexActivity: "edge-ghosty.codex-activity.v1",
+  vercelTeamId: "edge-ghosty.vercel-team-id",
+  soundsEnabled: "edge-ghosty.sounds-enabled",
+  soundVolume: "edge-ghosty.sound-volume",
 };
 const LEGACY_KEYS = {
   length: "edge-mochi.bar-height",
@@ -102,12 +120,19 @@ const LEGACY_KEYS = {
   petSkin: "edge-mochi.pet-skin",
   petAccessory: "edge-mochi.pet-accessory",
   focus: "edge-mochi.focus",
+  focusHistory: "edge-mochi.focus-history",
+  onboardingComplete: "edge-mochi.onboarding-complete",
   utilityPopup: "edge-mochi.utility-popup",
   utilityPopupPosition: "edge-mochi.utility-popup-position",
   quickChatModel: "edge-mochi.quick-chat-model",
   quickChatReasoning: "edge-mochi.quick-chat-effort",
   quickChatEntry: "edge-mochi.quick-chat-entry",
   quickChatWebsiteCache: "edge-mochi.quick-chat-website-cache.v1",
+  quickChatDraft: "edge-mochi.quick-chat-draft",
+  codexActivity: "edge-mochi.codex-activity.v1",
+  vercelTeamId: "edge-mochi.vercel-team-id",
+  soundsEnabled: "edge-mochi.sounds-enabled",
+  soundVolume: "edge-mochi.sound-volume",
 };
 for (const name of Object.keys(KEYS) as Array<keyof typeof KEYS>) {
   const legacyValue = localStorage.getItem(LEGACY_KEYS[name]);
@@ -116,9 +141,16 @@ for (const name of Object.keys(KEYS) as Array<keyof typeof KEYS>) {
   }
 }
 if (localStorage.getItem(KEYS.petName) === "Mochi") localStorage.setItem(KEYS.petName, "Ghosty");
-if (!["focus", "pocket", "customize", "clipboard", "chat"].includes(localStorage.getItem(KEYS.utilityPopup) ?? "")) {
+if (!["focus", "focus-summary", "codex-activity", "pocket", "customize", "clipboard", "chat"].includes(localStorage.getItem(KEYS.utilityPopup) ?? "")) {
   localStorage.removeItem(KEYS.utilityPopup);
 }
+if (localStorage.getItem(KEYS.onboardingComplete) === null
+  && [KEYS.shortcuts, KEYS.focus, KEYS.displays, KEYS.petName].some((key) => localStorage.getItem(key) !== null)) {
+  localStorage.setItem(KEYS.onboardingComplete, "true");
+}
+const currentWindowLabel = getCurrentWindow().label;
+let onboardingOpen = currentWindowLabel === "main" && localStorage.getItem(KEYS.onboardingComplete) !== "true";
+let onboardingStep: "welcome" | "choices" = "welcome";
 const QUICK_CHAT_SITE_CACHE_LIMIT = 256;
 const QUICK_CHAT_SITE_ALIASES: Readonly<Record<string, string>> = {
   github: "https://github.com",
@@ -208,6 +240,8 @@ const MIN_CLOSE_DELAY = 0;
 const MAX_CLOSE_DELAY = 900;
 const EAR_RADIUS = 14;
 const MAX_SAVED_TEXT = 50_000;
+const MAX_CHAT_TEXT_CONTEXT_CHARS = 6_000;
+const LARGE_CHAT_FILE_WARNING_BYTES = 25 * 1024 * 1024;
 
 function readNumber(key: string, fallback: number, min: number, max: number, step = 1) {
   const stored = localStorage.getItem(key);
@@ -232,7 +266,7 @@ function readDisplayIds(): string[] {
 }
 
 let volume = 62;
-let expanded = false;
+let expanded = onboardingOpen;
 let settingsOpen = false;
 let activeTab: MenuTab = "home";
 let utilityPopupMode: UtilityPopupMode | null = null;
@@ -240,6 +274,7 @@ let utilityPopupBlurTimer: number | undefined;
 let utilityPopupPositionSaveTimer: number | undefined;
 let latestUtilityPopupPosition: UtilityPopupPosition | null = null;
 let quickChatMessages: QuickChatMessage[] = [];
+let quickChatDraft = localStorage.getItem(KEYS.quickChatDraft) ?? "";
 let quickChatApprovals: QuickChatApproval[] = [];
 let quickChatApprovalBusy = new Set<string>();
 let quickChatFileChangePreviews = new Map<string, string>();
@@ -271,15 +306,23 @@ let selectedDisplayIds = readDisplayIds();
 let displays: DisplayInfo[] = [];
 let draggedId = "";
 let shortcuts = readShortcuts();
+let onboardingSelectedShortcutIds = new Set(shortcuts.slice(0, 3).map((shortcut) => shortcut.id));
 let pocketItems = readPocketItems();
 let clipboardEntries = readClipboardEntries();
 let petName = localStorage.getItem(KEYS.petName) || "Ghosty";
-let petSkin: PetSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight"], "pearl");
-let petAccessory: PetAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
+let petSkin: PetSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight", "mint", "coral", "lavender"], "pearl");
+let petAccessory: PetAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow", "halo", "leaf", "crown"], "none");
 let focusState = readFocusState();
+let focusHistory = readFocusHistory();
+let autoStartEnabled = false;
+let autoStartLoading = true;
+let autoStartBusy = false;
+let autoStartError = "";
 let mediaInfo: MediaInfo = { title: "", artist: "", playing: false };
 let codexHooksEnabled = false;
 let codexHooksBusy = true;
+let codexHooksNeedsReview = false;
+let codexHookPreview: CodexHookPreview | null = null;
 let codexHooksStatusMessage = "Verificando a configuração do Codex…";
 let codexPollPending = false;
 let latestCodexPetState: { state: PetState; detail: string; occurredAt: number } | null = null;
@@ -289,6 +332,28 @@ let pendingCodexApprovals: CodexApproval[] = [];
 let codexApprovalSubmitting = false;
 let codexApprovalError = "";
 let codexApprovalPresentationKey = "";
+let codexActivity = loadCodexActivity();
+let codexRecentActivity: CodexRecentActivity[] = [];
+const codexTaskStarts = new Map<string, number>();
+let activeHomeIntegration: "github" | "vercel" = "github";
+let githubConnected = false;
+let githubStatusLoading = true;
+let githubLoading = false;
+let githubStatusMessage = "Verificando conexão com o GitHub…";
+let githubError = "";
+let githubSnapshot: GithubSnapshot | null = null;
+let updatesPaused = false;
+let githubRefreshInterval: number | undefined;
+let vercelConnected = false;
+let vercelStatusLoading = true;
+let vercelLoading = false;
+let vercelStatusMessage = "Verificando conexão com a Vercel…";
+let vercelError = "";
+let vercelSnapshot: VercelSnapshot | null = null;
+let vercelTeamId = localStorage.getItem(KEYS.vercelTeamId) ?? "";
+let vercelRefreshInterval: number | undefined;
+let soundEnabled = localStorage.getItem(KEYS.soundsEnabled) === "true";
+let soundVolume = readNumber(KEYS.soundVolume, 24, 0, 100);
 const codexApprovalExpiryTimers = new Map<string, number>();
 let approvalHitBoundsInterval: number | undefined;
 let approvalHitBoundsStopTimer: number | undefined;
@@ -319,6 +384,13 @@ let rectPublishAttempt = 0;
 let wasPointerInNativeIsland = false;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
+setGhostySoundEnabled(soundEnabled);
+setGhostySoundVolume(soundVolume / 100);
+app.addEventListener("click", (event) => {
+  if (!soundEnabled) return;
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest("button")) playGhostySound("tap");
+});
 
 function readJson<T>(key: string, fallback: T): T {
   try {
@@ -326,6 +398,480 @@ function readJson<T>(key: string, fallback: T): T {
     return parsed === null ? fallback : parsed as T;
   } catch {
     return fallback;
+  }
+}
+
+function emptyCodexActivityDay(): CodexActivityDay {
+  return { sessions: 0, completed: 0, interrupted: 0, toolCalls: 0, approvals: 0, activeMs: 0 };
+}
+
+function loadCodexActivity(): CodexActivity {
+  const saved = readJson<unknown>(KEYS.codexActivity, {});
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+  const result: CodexActivity = {};
+  for (const [date, item] of Object.entries(saved as Record<string, unknown>)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !item || typeof item !== "object") continue;
+    const values = item as Record<string, unknown>;
+    result[date] = {
+      sessions: Math.max(0, Number(values.sessions) || 0),
+      completed: Math.max(0, Number(values.completed) || 0),
+      interrupted: Math.max(0, Number(values.interrupted) || 0),
+      toolCalls: Math.max(0, Number(values.toolCalls) || 0),
+      approvals: Math.max(0, Number(values.approvals) || 0),
+      activeMs: Math.max(0, Number(values.activeMs) || 0),
+    };
+  }
+  return result;
+}
+
+function activityDate(timestamp = Date.now()) {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function recentCodexActivity(days = 7) {
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (days - index - 1));
+    const key = activityDate(date.getTime());
+    return { date: key, values: codexActivity[key] ?? emptyCodexActivityDay() };
+  });
+}
+
+function codexActivityTotals() {
+  return recentCodexActivity().reduce((total, day) => {
+    total.sessions += day.values.sessions;
+    total.completed += day.values.completed;
+    total.interrupted += day.values.interrupted;
+    total.toolCalls += day.values.toolCalls;
+    total.approvals += day.values.approvals;
+    total.activeMs += day.values.activeMs;
+    return total;
+  }, emptyCodexActivityDay());
+}
+
+function recordCodexRecentActivity(events: CodexHookEvent[]) {
+  let changed = false;
+  const visibleEvents = new Set([
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest",
+    "SubagentStart", "SubagentStop", "Stop", "Interrupt", "SessionEnd",
+  ]);
+  for (const event of events) {
+    if (!visibleEvents.has(event.eventName)) continue;
+    codexRecentActivity.push({
+      eventName: event.eventName,
+      occurredAt: event.occurredAt || Date.now(),
+      toolName: event.toolName?.slice(0, 48) ?? null,
+      agentType: event.agentType?.slice(0, 40) ?? null,
+    });
+    changed = true;
+  }
+  if (codexRecentActivity.length > 12) codexRecentActivity.splice(0, codexRecentActivity.length - 12);
+  return changed;
+}
+
+function codexRecentActivityLabel(event: CodexRecentActivity) {
+  const tool = event.toolName ? ` · ${event.toolName}` : "";
+  switch (event.eventName) {
+    case "SessionStart": return "Sessão iniciada";
+    case "UserPromptSubmit": return "Nova tarefa enviada";
+    case "PreToolUse": return `Iniciou uma etapa${tool}`;
+    case "PostToolUse": return `Concluiu uma etapa${tool}`;
+    case "PermissionRequest": return `Pediu aprovação${tool}`;
+    case "SubagentStart": return `Delegou${event.agentType ? ` · ${event.agentType}` : " uma etapa"}`;
+    case "SubagentStop": return `Concluiu etapa delegada${event.agentType ? ` · ${event.agentType}` : ""}`;
+    case "Stop": return "Tarefa concluída";
+    case "Interrupt": return "Tarefa interrompida";
+    case "SessionEnd": return "Sessão encerrada";
+    default: return "Atividade do Codex";
+  }
+}
+
+function renderCodexRecentActivity(limit = 2) {
+  const visible = codexRecentActivity.slice(-limit).reverse();
+  return `<div class="codex-recent-activity" aria-live="polite"><small>ATIVIDADE RECENTE · SÓ NESTA SESSÃO</small>${visible.length
+    ? visible.map((event) => {
+      const time = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(event.occurredAt);
+      return `<div class="codex-recent-event"><span>${escapeHtml(codexRecentActivityLabel(event))}</span><time>${time}</time></div>`;
+    }).join("")
+    : '<span class="codex-recent-empty">As etapas aparecem aqui enquanto o Ghosty estiver conectado.</span>'}</div>`;
+}
+
+function recordCodexActivity(events: CodexHookEvent[]) {
+  if (updatesPaused || currentWindowLabel !== "main") return;
+  const recentChanged = recordCodexRecentActivity(events);
+  let changed = false;
+  for (const event of events) {
+    const date = activityDate(event.occurredAt || Date.now());
+    const values = codexActivity[date] ?? (codexActivity[date] = emptyCodexActivityDay());
+    const sessionKey = event.sessionId || "default-session";
+    if (event.eventName === "SessionStart") { values.sessions += 1; changed = true; }
+    else if (event.eventName === "UserPromptSubmit") { codexTaskStarts.set(sessionKey, event.occurredAt); }
+    else if (event.eventName === "PostToolUse") { values.toolCalls += 1; changed = true; }
+    else if (event.eventName === "PermissionRequest") { values.approvals += 1; changed = true; }
+    else if (event.eventName === "Stop" || event.eventName === "Interrupt" || event.eventName === "SessionEnd") {
+      const startedAt = codexTaskStarts.get(sessionKey);
+      codexTaskStarts.delete(sessionKey);
+      if (event.eventName === "Stop") values.completed += 1;
+      if (event.eventName === "Interrupt") values.interrupted += 1;
+      if (startedAt && event.occurredAt >= startedAt && event.occurredAt - startedAt <= 6 * 60 * 60_000) {
+        values.activeMs += event.occurredAt - startedAt;
+      }
+      changed = changed || event.eventName !== "SessionEnd";
+    }
+  }
+  if (!changed) {
+    if (recentChanged) refreshCodexActivityUi();
+    return;
+  }
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 90);
+  for (const date of Object.keys(codexActivity)) if (new Date(`${date}T12:00:00`).getTime() < cutoff.getTime()) delete codexActivity[date];
+  localStorage.setItem(KEYS.codexActivity, JSON.stringify(codexActivity));
+  refreshCodexActivityUi();
+}
+
+function renderCodexActivityCard() {
+  const totals = codexActivityTotals();
+  const focusedMinutes = Math.round(totals.activeMs / 60_000);
+  return `
+    <button class="home-overview-link codex-activity-summary" data-action="open-utility-popup" data-popup="codex-activity">
+      <span class="overview-link-copy"><small>ATIVIDADE DO CODEX · 7 DIAS</small><strong>${totals.completed} tarefas concluídas</strong><span>${focusedMinutes} min ativos · ${totals.approvals} aprovações</span></span>
+      <span class="overview-link-arrow">↗</span>
+    </button>`;
+}
+
+function renderCodexActivityPopup() {
+  const days = recentCodexActivity();
+  const totals = codexActivityTotals();
+  const peak = Math.max(1, ...days.map(({ values }) => values.activeMs));
+  const labels = new Intl.DateTimeFormat("pt-BR", { weekday: "short" });
+  return `
+    <section class="codex-activity-page">
+      ${renderCodexRecentActivity(8)}
+      <div class="activity-summary-metrics">
+        <article><strong>${totals.completed}</strong><small>tarefas concluídas</small></article>
+        <article><strong>${Math.round(totals.activeMs / 60_000)} min</strong><small>tempo ativo estimado</small></article>
+        <article><strong>${totals.sessions}</strong><small>sessões iniciadas</small></article>
+      </div>
+      <div class="activity-day-list">${days.map(({ date, values }) => {
+        const label = labels.format(new Date(`${date}T12:00:00`)).replace(".", "");
+        return `<div class="activity-day-row"><div><strong>${escapeHtml(label)}</strong><small>${values.completed} tarefas · ${values.toolCalls} etapas</small></div><span class="activity-bar"><i style="--activity-width:${Math.max(2, values.activeMs / peak * 100)}%"></i></span><output>${Math.round(values.activeMs / 60_000)} min</output></div>`;
+      }).join("")}</div>
+      <small class="settings-note">As etapas recentes ficam só em memória nesta sessão. O resumo guarda contagens e durações locais por até 90 dias; prompts, respostas e comandos não são registrados.</small>
+      <button class="reset-button" data-action="clear-codex-activity">Limpar resumo local</button>
+    </section>`;
+}
+
+function renderGithubPull(pull: GithubPullRequest) {
+  const url = safeQuickChatWebsiteUrl(pull.url);
+  if (!url) return "";
+  const ci = pull.ciStatus ? `<small class="github-ci ${pull.ciStatus === "Falhou" ? "is-failed" : pull.ciStatus === "Aprovado" ? "is-passed" : ""}">${escapeHtml(pull.ciStatus)}</small>` : "";
+  return `<button class="github-pull" data-action="open-github-link" data-url="${escapeHtml(url)}"><span class="github-pull-main"><strong>${escapeHtml(pull.title)}</strong><small>${escapeHtml(pull.repository)} · #${pull.number}${pull.draft ? " · rascunho" : ""}</small></span>${ci}<span class="overview-link-arrow">↗</span></button>`;
+}
+
+function renderGithubContent() {
+  if (githubStatusLoading) return '<div class="github-empty">Verificando conexão com o GitHub…</div>';
+  if (!githubConnected) return `<div class="github-empty"><span>Veja PRs abertos, revisões pedidas e status do CI aqui.</span><button data-action="github-open-settings">Conectar GitHub</button></div>`;
+  if (githubLoading && !githubSnapshot) return '<div class="github-empty">Buscando seus pull requests…</div>';
+  if (githubError) return `<div class="github-empty is-error">${escapeHtml(githubError)}<button data-action="github-refresh" ${updatesPaused || githubLoading ? "disabled" : ""}>Tentar novamente</button></div>`;
+  if (!githubSnapshot) return `<div class="github-empty">${updatesPaused ? "Atualizações pausadas." : "Ainda não há dados carregados."}<button data-action="github-refresh" ${updatesPaused || githubLoading ? "disabled" : ""}>Atualizar</button></div>`;
+  const authored = githubSnapshot.authored.slice(0, 3);
+  const reviews = githubSnapshot.reviewRequested.slice(0, 3);
+  const checked = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(githubSnapshot.checkedAt);
+  const content = `${authored.map(renderGithubPull).join("")}${reviews.map(renderGithubPull).join("")}`;
+  return `<div class="github-overview-meta"><span>@${escapeHtml(githubSnapshot.login)}</span><span>${updatesPaused ? "Atualizações pausadas" : githubLoading ? "Atualizando…" : `Atualizado às ${checked}`}</span></div>
+    ${content ? `<div class="github-pull-list">${content}</div>` : '<div class="github-empty">Sem PRs abertos ou revisões pendentes.</div>'}
+    <div class="github-overview-footer"><small>${authored.length} seus · ${reviews.length} para revisar</small><button data-action="github-refresh" aria-label="Atualizar GitHub" title="Atualizar" ${updatesPaused || githubLoading ? "disabled" : ""}>↻</button></div>`;
+}
+
+function renderGithubCard() {
+  const githubActive = activeHomeIntegration === "github";
+  const connected = githubActive ? githubConnected : vercelConnected;
+  const loading = githubActive ? githubLoading : vercelLoading;
+  return `<section class="home-overview-section github-card integration-dashboard">
+    <header class="overview-section-heading integration-heading"><span><small>INTEGRAÇÕES</small><span class="integration-tabs" role="tablist" aria-label="Serviço exibido"><button class="integration-tab ${githubActive ? "is-active" : ""}" data-action="integration-tab" data-integration="github" role="tab" aria-selected="${githubActive}">GitHub</button><button class="integration-tab ${!githubActive ? "is-active" : ""}" data-action="integration-tab" data-integration="vercel" role="tab" aria-selected="${!githubActive}">Vercel</button></span></span><button data-action="integration-refresh" aria-label="Atualizar ${githubActive ? "GitHub" : "Vercel"}" title="Atualizar" ${loading || updatesPaused || !connected ? "disabled" : ""}>↻</button></header>
+    <div class="integration-card-content">${githubActive ? renderGithubContent() : renderVercelContent()}</div>
+  </section>`;
+}
+
+function renderVercelContent() {
+  if (vercelStatusLoading) return '<div class="github-empty">Verificando conexão com a Vercel…</div>';
+  if (!vercelConnected) return `<div class="github-empty"><span>Veja o estado e as implantações recentes dos seus projetos.</span><button data-action="vercel-open-settings">Conectar Vercel</button></div>`;
+  if (vercelLoading && !vercelSnapshot) return '<div class="github-empty">Buscando as implantações…</div>';
+  if (vercelError && !vercelSnapshot) return `<div class="github-empty is-error">${escapeHtml(vercelError)}<button data-action="integration-refresh">Tentar novamente</button></div>`;
+  if (!vercelSnapshot) return `<div class="github-empty">${updatesPaused ? "Atualizações pausadas." : "Ainda não há dados carregados."}<button data-action="integration-refresh" ${updatesPaused || vercelLoading ? "disabled" : ""}>Atualizar</button></div>`;
+  const checked = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(vercelSnapshot.checkedAt);
+  const rows = vercelSnapshot.deployments.map((deployment) => {
+    const url = safeQuickChatWebsiteUrl(deployment.url);
+    if (!url) return "";
+    const state = deployment.state.toLocaleUpperCase("en-US");
+    const stateClass = state === "READY" ? "is-passed" : ["ERROR", "CANCELED"].includes(state) ? "is-failed" : "";
+    const stateLabel = state === "READY" ? "Pronto" : state === "ERROR" ? "Falhou" : state === "BUILDING" || state === "INITIALIZING" ? "Em andamento" : state === "CANCELED" ? "Cancelado" : state;
+    const detail = [deployment.target === "production" ? "produção" : deployment.target, deployment.branch].filter(Boolean).join(" · ");
+    return `<button class="github-pull vercel-deployment" data-action="open-vercel-link" data-url="${escapeHtml(url)}"><span class="github-pull-main"><strong>${escapeHtml(deployment.name)}</strong><small>${escapeHtml(detail || deployment.commitMessage || "Implantação recente")}</small></span><small class="github-ci ${stateClass}">${escapeHtml(stateLabel)}</small><span class="overview-link-arrow">↗</span></button>`;
+  }).join("");
+  const error = vercelError ? `<small class="vercel-refresh-warning">${escapeHtml(vercelError)}</small>` : "";
+  return `<div class="github-overview-meta"><span>${escapeHtml(vercelSnapshot.username)}${vercelTeamId ? " · equipe" : " · pessoal"}</span><span>${updatesPaused ? "Atualizações pausadas" : vercelLoading ? "Atualizando…" : `Atualizado às ${checked}`}</span></div>
+    ${rows ? `<div class="github-pull-list">${rows}</div>` : '<div class="github-empty">Nenhuma implantação recente nesta conta.</div>'}
+    ${error}<div class="github-overview-footer"><small>${vercelSnapshot.deployments.length} implantações recentes</small><button data-action="integration-refresh" aria-label="Atualizar Vercel" title="Atualizar" ${updatesPaused || vercelLoading ? "disabled" : ""}>↻</button></div>`;
+}
+
+function renderHomeIntegrationContent() {
+  return activeHomeIntegration === "github" ? renderGithubContent() : renderVercelContent();
+}
+
+function refreshGithubCard() {
+  const content = app.querySelector<HTMLElement>(".integration-card-content");
+  if (content) {
+    content.innerHTML = renderHomeIntegrationContent();
+    bindGithubActions(content);
+  }
+  const selectedConnected = activeHomeIntegration === "github" ? githubConnected : vercelConnected;
+  const selectedLoading = activeHomeIntegration === "github" ? githubLoading : vercelLoading;
+  app.querySelectorAll<HTMLButtonElement>("[data-action=integration-refresh]").forEach((button) => { button.disabled = selectedLoading || updatesPaused || !selectedConnected; });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=github-refresh]").forEach((button) => { button.disabled = githubLoading || updatesPaused || !githubConnected; });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=integration-tab]").forEach((button) => {
+    const active = button.dataset.integration === activeHomeIntegration;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=integration-refresh]").forEach((button) => {
+    const service = activeHomeIntegration === "github" ? "GitHub" : "Vercel";
+    button.setAttribute("aria-label", `Atualizar ${service}`);
+    button.title = `Atualizar ${service}`;
+  });
+}
+
+function bindGithubActions(container: ParentNode) {
+  container.querySelectorAll<HTMLButtonElement>("[data-action=integration-tab]").forEach((button) => button.addEventListener("click", () => {
+    activeHomeIntegration = button.dataset.integration === "vercel" ? "vercel" : "github";
+    refreshGithubCard();
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=integration-refresh]").forEach((button) => button.addEventListener("click", () => {
+    if (activeHomeIntegration === "github") void refreshGithubSnapshot();
+    else void refreshVercelSnapshot();
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=github-refresh]").forEach((button) => button.addEventListener("click", () => void refreshGithubSnapshot()));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=vercel-refresh]").forEach((button) => button.addEventListener("click", () => void refreshVercelSnapshot()));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=github-open-settings]").forEach((button) => button.addEventListener("click", () => {
+    settingsOpen = true;
+    expanded = true;
+    render();
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=open-github-link]").forEach((button) => button.addEventListener("click", () => {
+    const url = safeQuickChatWebsiteUrl(button.dataset.url);
+    if (url) void invoke("open_targets", { targets: [url] }).catch(() => undefined);
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=vercel-open-settings]").forEach((button) => button.addEventListener("click", () => {
+    settingsOpen = true;
+    expanded = true;
+    render();
+  }));
+  container.querySelectorAll<HTMLButtonElement>("[data-action=open-vercel-link]").forEach((button) => button.addEventListener("click", () => {
+    const url = safeQuickChatWebsiteUrl(button.dataset.url);
+    if (url) void invoke("open_targets", { targets: [url] }).catch(() => undefined);
+  }));
+}
+
+async function refreshGithubSnapshot() {
+  if (!githubConnected || githubLoading || updatesPaused) return;
+  githubLoading = true;
+  githubError = "";
+  refreshGithubCard();
+  try {
+    githubSnapshot = await invoke<GithubSnapshot>("github_refresh");
+    githubStatusMessage = `Conectado como @${githubSnapshot.login}.`;
+  } catch (error) {
+    githubError = String(error).replace(/^Error: /, "");
+    githubStatusMessage = githubError;
+  } finally {
+    githubLoading = false;
+    refreshGithubCard();
+    refreshGithubSettingsUi();
+  }
+}
+
+async function refreshGithubStatus() {
+  githubStatusLoading = true;
+  try {
+    githubConnected = await invoke<boolean>("github_token_status");
+    githubStatusMessage = githubConnected ? "GitHub conectado. O token fica no Gerenciador de Credenciais do Windows." : "GitHub desconectado.";
+    githubSnapshot = await invoke<GithubSnapshot | null>("github_cached_snapshot");
+  } catch (error) {
+    githubStatusMessage = `Não consegui verificar o GitHub: ${String(error)}`;
+  } finally {
+    githubStatusLoading = false;
+    refreshGithubCard();
+    refreshGithubSettingsUi();
+  }
+  if (githubConnected && !updatesPaused) void refreshGithubSnapshot();
+}
+
+function refreshGithubSettingsUi() {
+  app.querySelectorAll<HTMLElement>("[data-github-status]").forEach((element) => {
+    element.textContent = githubLoading ? "Atualizando seus pull requests…" : githubStatusMessage;
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=github-save-token]").forEach((button) => { button.disabled = githubStatusLoading || githubLoading || updatesPaused; });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=github-clear-token]").forEach((button) => { button.hidden = !githubConnected; });
+}
+
+async function saveGithubToken() {
+  const input = app.querySelector<HTMLInputElement>("#github-token");
+  const button = app.querySelector<HTMLButtonElement>("[data-action=github-save-token]");
+  const token = input?.value.trim() ?? "";
+  if (!token || githubLoading) return;
+  const wasConnected = githubConnected;
+  githubStatusLoading = true;
+  githubStatusMessage = "Validando o token e salvando no Windows…";
+  refreshGithubSettingsUi();
+  try {
+    const login = await invoke<string>("github_save_token", { token });
+    githubConnected = true;
+    githubSnapshot = null;
+    githubError = "";
+    githubStatusMessage = `Conectado como @${login}. Token protegido pelo Gerenciador de Credenciais do Windows.`;
+    if (input) input.value = "";
+    if (button) button.disabled = false;
+    githubStatusLoading = false;
+    refreshGithubSettingsUi();
+    void refreshGithubSnapshot();
+  } catch (error) {
+    githubStatusMessage = String(error).replace(/^Error: /, "");
+    githubConnected = wasConnected;
+    refreshGithubSettingsUi();
+  } finally {
+    githubStatusLoading = false;
+    refreshGithubSettingsUi();
+    refreshGithubCard();
+  }
+}
+
+async function clearGithubToken() {
+  try {
+    await invoke("github_clear_token");
+    githubConnected = false;
+    githubSnapshot = null;
+    githubError = "";
+    githubStatusMessage = "GitHub desconectado; a credencial foi removida do Windows.";
+  } catch (error) {
+    githubStatusMessage = `Não consegui remover o token: ${String(error)}`;
+  }
+  refreshGithubSettingsUi();
+  refreshGithubCard();
+}
+
+async function refreshVercelSnapshot() {
+  if (!vercelConnected || vercelLoading || updatesPaused) return;
+  vercelLoading = true;
+  vercelError = "";
+  refreshGithubCard();
+  refreshVercelSettingsUi();
+  try {
+    vercelSnapshot = await invoke<VercelSnapshot>("vercel_refresh", { teamId: vercelTeamId || null });
+    vercelStatusMessage = `Conectado à Vercel como ${vercelSnapshot.username}.`;
+  } catch (error) {
+    vercelError = String(error).replace(/^Error: /, "");
+    vercelStatusMessage = vercelError;
+  } finally {
+    vercelLoading = false;
+    refreshGithubCard();
+    refreshVercelSettingsUi();
+  }
+}
+
+async function refreshVercelStatus() {
+  vercelStatusLoading = true;
+  try {
+    vercelConnected = await invoke<boolean>("vercel_token_status");
+    vercelSnapshot = await invoke<VercelSnapshot | null>("vercel_cached_snapshot");
+    vercelStatusMessage = vercelConnected
+      ? "Vercel conectada. O token fica no Gerenciador de Credenciais do Windows."
+      : "Vercel desconectada.";
+  } catch (error) {
+    vercelStatusMessage = `Não consegui verificar a Vercel: ${String(error)}`;
+  } finally {
+    vercelStatusLoading = false;
+    refreshGithubCard();
+    refreshVercelSettingsUi();
+  }
+  if (vercelConnected && !updatesPaused) void refreshVercelSnapshot();
+}
+
+function refreshVercelSettingsUi() {
+  app.querySelectorAll<HTMLElement>("[data-vercel-status]").forEach((element) => {
+    element.textContent = vercelLoading ? "Atualizando as implantações…" : vercelStatusMessage;
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=vercel-save-token]").forEach((button) => {
+    button.disabled = vercelStatusLoading || vercelLoading || updatesPaused;
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=vercel-clear-token]").forEach((button) => { button.hidden = !vercelConnected; });
+  app.querySelectorAll<HTMLInputElement>("#vercel-team-id").forEach((input) => { input.disabled = vercelStatusLoading || vercelLoading; });
+}
+
+async function saveVercelToken() {
+  const input = app.querySelector<HTMLInputElement>("#vercel-token");
+  const button = app.querySelector<HTMLButtonElement>("[data-action=vercel-save-token]");
+  const teamInput = app.querySelector<HTMLInputElement>("#vercel-team-id");
+  const token = input?.value.trim() ?? "";
+  if (!token || vercelLoading || updatesPaused) return;
+  const wasConnected = vercelConnected;
+  vercelTeamId = teamInput?.value.trim() ?? vercelTeamId;
+  localStorage.setItem(KEYS.vercelTeamId, vercelTeamId);
+  vercelStatusLoading = true;
+  vercelStatusMessage = "Validando o token e salvando no Windows…";
+  refreshVercelSettingsUi();
+  try {
+    const username = await invoke<string>("vercel_save_token", { tokenValue: token });
+    vercelConnected = true;
+    vercelSnapshot = null;
+    vercelError = "";
+    vercelStatusMessage = `Conectado à Vercel como ${username}. O token fica no Gerenciador de Credenciais do Windows.`;
+    if (input) input.value = "";
+    if (button) button.disabled = false;
+    vercelStatusLoading = false;
+    refreshVercelSettingsUi();
+    void refreshVercelSnapshot();
+  } catch (error) {
+    vercelStatusMessage = String(error).replace(/^Error: /, "");
+    vercelConnected = wasConnected;
+  } finally {
+    vercelStatusLoading = false;
+    refreshVercelSettingsUi();
+    refreshGithubCard();
+  }
+}
+
+async function clearVercelToken() {
+  try {
+    await invoke("vercel_clear_token");
+    vercelConnected = false;
+    vercelSnapshot = null;
+    vercelError = "";
+    vercelStatusMessage = "Vercel desconectada; a credencial foi removida do Windows.";
+  } catch (error) {
+    vercelStatusMessage = `Não consegui remover o token: ${String(error)}`;
+  }
+  refreshVercelSettingsUi();
+  refreshGithubCard();
+}
+
+function refreshCodexActivityUi() {
+  const recent = app.querySelector<HTMLElement>(".activity-overview-section .codex-recent-activity");
+  if (recent) recent.outerHTML = renderCodexRecentActivity(2);
+  const summary = app.querySelector<HTMLElement>(".codex-activity-summary");
+  if (summary) {
+    summary.outerHTML = renderCodexActivityCard();
+    app.querySelector<HTMLElement>(".codex-activity-summary")?.addEventListener("click", () => void openUtilityPopup("codex-activity"));
+  }
+  if (utilityPopupMode === "codex-activity" && currentWindowLabel === "utility-popup") {
+    const body = app.querySelector<HTMLElement>(".utility-popup-body");
+    if (body) {
+      body.innerHTML = renderCodexActivityPopup();
+      bindCodexActivityPopup(body);
+    }
   }
 }
 
@@ -349,18 +895,37 @@ function readClipboardEntries(): ClipboardEntry[] {
 }
 
 function readFocusState(): FocusState {
-  const fallback = { durationMs: 25 * 60_000, remainingMs: 25 * 60_000, endsAt: 0, running: false };
+  const fallback = { durationMs: 25 * 60_000, remainingMs: 25 * 60_000, endsAt: 0, running: false, startedAt: 0 };
   const value = readJson<Partial<FocusState>>(KEYS.focus, fallback);
   if (typeof value.durationMs !== "number" || !Number.isFinite(value.durationMs)
     || typeof value.remainingMs !== "number" || !Number.isFinite(value.remainingMs)
     || typeof value.endsAt !== "number" || !Number.isFinite(value.endsAt)
     || typeof value.running !== "boolean") return fallback;
+  const durationMs = Math.max(60_000, Math.min(180 * 60_000, value.durationMs));
+  const remainingMs = Math.max(0, Math.min(180 * 60_000, value.remainingMs));
+  const endsAt = value.endsAt;
+  const running = value.running;
+  const savedStartedAt = typeof value.startedAt === "number" && Number.isFinite(value.startedAt) ? value.startedAt : 0;
   return {
-    durationMs: Math.max(60_000, Math.min(180 * 60_000, value.durationMs!)),
-    remainingMs: Math.max(0, Math.min(180 * 60_000, value.remainingMs!)),
-    endsAt: value.endsAt!,
-    running: value.running,
+    durationMs,
+    remainingMs,
+    endsAt,
+    running,
+    startedAt: running ? (savedStartedAt > 0 ? savedStartedAt : Math.max(0, endsAt - remainingMs)) : 0,
   };
+}
+
+function readFocusHistory(): FocusHistoryEntry[] {
+  const entries = readJson<unknown>(KEYS.focusHistory, []);
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((entry): entry is FocusHistoryEntry => {
+    if (!entry || typeof entry !== "object") return false;
+    const value = entry as Record<string, unknown>;
+    return typeof value.id === "string" && typeof value.startedAt === "number" && Number.isFinite(value.startedAt)
+      && typeof value.endedAt === "number" && Number.isFinite(value.endedAt) && value.endedAt >= value.startedAt
+      && typeof value.durationMs === "number" && Number.isFinite(value.durationMs) && value.durationMs > 0
+      && typeof value.completed === "boolean";
+  }).slice(-1000);
 }
 
 function readChoice<T extends string>(key: string, choices: readonly T[], fallback: T): T {
@@ -390,6 +955,87 @@ function focusRemainingMs() {
 function persistFocus() {
   focusState.remainingMs = focusRemainingMs();
   localStorage.setItem(KEYS.focus, JSON.stringify(focusState));
+}
+
+function persistFocusHistory() {
+  localStorage.setItem(KEYS.focusHistory, JSON.stringify(focusHistory));
+}
+
+function recordFocusSegment(completed: boolean) {
+  const startedAt = focusState.startedAt;
+  if (!startedAt) return;
+  const endedAt = Math.min(Date.now(), focusState.endsAt || Date.now());
+  const durationMs = Math.max(0, endedAt - startedAt);
+  if (durationMs >= 15_000) {
+    focusHistory = [...focusHistory, { id: makeId(), startedAt, endedAt, durationMs, completed }].slice(-1000);
+    persistFocusHistory();
+    paintFocusSummary();
+  }
+}
+
+function formatFocusTotal(durationMs: number) {
+  const totalMinutes = Math.max(durationMs > 0 ? 1 : 0, Math.round(durationMs / 60_000));
+  if (totalMinutes < 60) return `${totalMinutes} min`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours} h ${minutes} min` : `${hours} h`;
+}
+
+function getFocusWeekSnapshot() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const days = Array.from({ length: 7 }, (_, index) => {
+    const start = new Date(today);
+    start.setDate(today.getDate() - (6 - index));
+    const end = new Date(start);
+    end.setDate(start.getDate() + 1);
+    const startMs = start.getTime();
+    const endMs = end.getTime();
+    const totalMs = focusHistory.reduce((sum, entry) => {
+      return sum + Math.max(0, Math.min(entry.endedAt, endMs) - Math.max(entry.startedAt, startMs));
+    }, 0);
+    return {
+      startMs,
+      endMs,
+      label: new Intl.DateTimeFormat("pt-BR", { weekday: "short" }).format(start).replace(".", ""),
+      totalMs,
+    };
+  });
+  const rangeStart = days[0].startMs;
+  const rangeEnd = days[6].endMs;
+  return {
+    days,
+    totalMs: days.reduce((sum, day) => sum + day.totalMs, 0),
+    completedCount: focusHistory.filter((entry) => entry.completed && entry.endedAt >= rangeStart && entry.endedAt < rangeEnd).length,
+  };
+}
+
+function renderFocusSummary() {
+  const snapshot = getFocusWeekSnapshot();
+  const maximum = Math.max(1, ...snapshot.days.map((day) => day.totalMs));
+  const chartLabel = snapshot.days.map((day) => `${day.label}: ${formatFocusTotal(day.totalMs)}`).join(", ");
+  const bars = snapshot.days.map((day) => {
+    const height = day.totalMs > 0 ? Math.max(7, day.totalMs / maximum * 100) : 3;
+    return `<div class="focus-history-day" aria-label="${escapeHtml(day.label)}: ${escapeHtml(formatFocusTotal(day.totalMs))}">
+      <span>${day.totalMs > 0 ? escapeHtml(formatFocusTotal(day.totalMs)) : ""}</span>
+      <div class="focus-history-bar"><i style="--focus-bar-height:${height}%"></i></div>
+      <small>${escapeHtml(day.label)}</small>
+    </div>`;
+  }).join("");
+  return `
+    <section class="focus-history">
+      <button class="focus-history-back" data-action="focus-summary-back">← Voltar ao temporizador</button>
+      <div class="focus-history-card">
+        <span class="section-kicker">ÚLTIMOS 7 DIAS</span>
+        <strong class="focus-history-total">${escapeHtml(formatFocusTotal(snapshot.totalMs))}</strong>
+        <small>${snapshot.completedCount} ${snapshot.completedCount === 1 ? "ciclo concluído" : "ciclos concluídos"}</small>
+        <div class="focus-history-chart" role="img" aria-label="Tempo de foco por dia: ${escapeHtml(chartLabel)}">${bars}</div>
+        ${focusHistory.length === 0
+          ? '<p class="focus-history-empty">Suas sessões de foco aparecerão aqui.</p>'
+          : `<button class="focus-history-clear" data-action="focus-history-clear">Limpar histórico</button>`}
+      </div>
+      <small class="focus-history-footnote">O histórico fica salvo somente neste dispositivo.</small>
+    </section>`;
 }
 
 function getPetMood() {
@@ -541,13 +1187,13 @@ function animateIsland(open: boolean) {
   };
   const target = edge === "left"
     ? {
-      width: open ? 360 : barThickness,
-      height: open ? Math.min(650, Math.max(220, window.innerHeight - 64)) : barLength,
+      width: open ? Math.min(860, Math.max(220, window.innerWidth - 32)) : barThickness,
+      height: open ? Math.min(650, Math.max(220, window.innerHeight - 48)) : barLength,
       radius: open ? 22 : 4,
     }
     : {
-      width: open ? Math.min(760, Math.max(220, window.innerWidth - 64)) : barLength,
-      height: open ? 280 : barThickness,
+      width: open ? Math.min(1060, Math.max(220, window.innerWidth - 40)) : barLength,
+      height: open ? Math.min(380, Math.max(220, window.innerHeight - 32)) : barThickness,
       radius: open ? 22 : 4,
     };
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -683,6 +1329,7 @@ function renderPocketItems(limit = 8) {
    <article class="pocket-item" data-pocket-kind="${item.kind}">
       <span class="pocket-item-icon">${menuIcon(item.kind === "image" ? "image" : item.kind === "text" ? "text" : "file")}</span>
       <span class="pocket-item-copy"><strong title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</strong><small>${item.kind === "text" ? item.truncated ? "primeiros 50 mil caracteres" : "texto guardado" : "o original continua no lugar"}</small></span>
+      <button class="mini-icon pocket-ask" data-action="ask-pocket" data-pocket-id="${escapeHtml(item.id)}" aria-label="Perguntar ao Ghosty sobre ${escapeHtml(item.name)}" title="Perguntar ao Ghosty">✦</button>
       <button class="mini-icon" data-action="open-pocket" data-pocket-id="${escapeHtml(item.id)}" aria-label="Abrir ${escapeHtml(item.name)}" title="Abrir">↗</button>
       <button class="mini-icon" data-action="remove-pocket" data-pocket-id="${escapeHtml(item.id)}" aria-label="Tirar ${escapeHtml(item.name)} do bolso" title="Tirar do bolso">×</button>
     </article>`).join("");
@@ -748,6 +1395,19 @@ function renderHomePage() {
           <div class="home-shortcut-items">${renderHomeShortcutItems(3)}</div>
         </section>
       </section>
+      <aside class="home-overview-card">
+        ${renderGithubCard()}
+        <section class="home-overview-section activity-overview-section">
+          <header class="overview-section-heading"><span><small>SESSÕES LOCAIS</small><strong>Codex</strong></span><span class="codex-live-indicator ${codexTaskRunning ? "is-active" : ""}"></span></header>
+          ${renderCodexRecentActivity(2)}
+          ${renderCodexActivityCard()}
+        </section>
+        <section class="home-overview-utilities" aria-label="Utilitários">
+          <button data-action="open-utility-popup" data-popup="focus">◷<span>Foco</span></button>
+          <button data-action="open-utility-popup" data-popup="pocket">▣<span>Bolso ${pocketItems.length ? `· ${pocketItems.length}` : ""}</span></button>
+          <button data-action="open-utility-popup" data-popup="clipboard">¶<span>Prancheta</span></button>
+        </section>
+      </aside>
     </div>`;
 }
 
@@ -765,12 +1425,24 @@ function renderPetPage() {
           <button class="pet-tool" data-action="open-utility-popup" data-popup="customize" aria-label="Personalizar Ghosty" title="Personalizar">${menuIcon("settings")}</button>
         </div>
       </div>
+      <aside class="pet-side-panel">
+        <span class="section-kicker">SEU COMPANHEIRO</span>
+        <strong>${escapeHtml(petName)}</strong>
+        <p>Um cantinho para o que você está fazendo agora.</p>
+        <div class="pet-side-status"><i></i><span>${escapeHtml(petMoodLabel())}</span></div>
+        <div class="pet-side-pocket"><small>BOLSO DO GHOSTY</small><strong>${pocketItems.length}/8 itens guardados</strong><span>${held ? escapeHtml(held.name) : "Solte algo no Ghosty para guardar."}</span></div>
+        <div class="pet-side-actions">
+          <button data-action="open-utility-popup" data-popup="pocket">Abrir Bolso</button>
+          <button data-action="open-utility-popup" data-popup="customize">Personalizar</button>
+          <button data-action="open-utility-popup" data-popup="focus">Iniciar Foco</button>
+        </div>
+      </aside>
     </div>`;
 }
 
 function readUtilityPopupMode(): UtilityPopupMode | null {
   const mode = localStorage.getItem(KEYS.utilityPopup);
-  return mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard" || mode === "chat" ? mode : null;
+  return mode === "focus" || mode === "focus-summary" || mode === "codex-activity" || mode === "pocket" || mode === "customize" || mode === "clipboard" || mode === "chat" ? mode : null;
 }
 
 function readUtilityPopupPosition(): UtilityPopupPosition | null {
@@ -932,7 +1604,7 @@ function renderQuickChat() {
       <div class="quick-chat-thread ${hasConversation ? "is-active" : "is-idle"}" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0"><div class="quick-chat-messages">${renderQuickChatMessages()}</div></div>
       <div class="quick-chat-pet-mask">${renderPetCharacter("quick-chat-pet")}</div>
       <form class="quick-chat-composer" data-action="quick-chat-form" autocomplete="off">
-        <input id="quick-chat-input" name="message" type="text" maxlength="8000" aria-label="Mensagem para o Ghosty" ${quickChatLoading || quickChatServiceLoading || quickChatLoginPending ? "disabled" : ""} />
+        <input id="quick-chat-input" name="message" type="text" maxlength="8000" value="${escapeHtml(quickChatDraft)}" aria-label="Mensagem para o Ghosty" ${quickChatLoading || quickChatServiceLoading || quickChatLoginPending ? "disabled" : ""} />
       </form>
       <div class="quick-chat-controls">${renderQuickChatControls()}</div>
     </section>`;
@@ -946,6 +1618,7 @@ function renderUtilityPopupContent(mode: UtilityPopupMode) {
     return `
       <section class="utility-focus">
         <div class="utility-focus-intro"><span class="section-kicker">TEMPO DE FOCO</span><strong>Um passo de cada vez.</strong><small>O Ghosty acompanha seu ciclo com você.</small></div>
+        <button class="focus-history-link" data-action="focus-summary-open">Ver resumo dos últimos 7 dias →</button>
         <div class="utility-focus-clock" id="focus-countdown">${formatDuration(remaining)}</div>
         <div class="focus-progress utility-focus-progress"><i id="focus-progress" style="--progress:${progress}%"></i></div>
         <div class="utility-focus-controls">
@@ -955,6 +1628,8 @@ function renderUtilityPopupContent(mode: UtilityPopupMode) {
         <small class="focus-status utility-focus-status" id="focus-status"></small>
       </section>`;
   }
+  if (mode === "focus-summary") return renderFocusSummary();
+  if (mode === "codex-activity") return renderCodexActivityPopup();
   if (mode === "pocket") {
     return `
       <section class="utility-pocket">
@@ -969,9 +1644,9 @@ function renderUtilityPopupContent(mode: UtilityPopupMode) {
       <section class="utility-customize">
         <form class="pet-name-form" data-action="pet-name-form"><input name="pet-name" value="${escapeHtml(petName)}" maxlength="24" aria-label="Nome do pet" /><button class="secondary-action">Salvar nome</button></form>
         <label class="custom-label" for="pet-skin">Aparência</label>
-        <select id="pet-skin"><option value="pearl" ${petSkin === "pearl" ? "selected" : ""}>Pérola</option><option value="smoke" ${petSkin === "smoke" ? "selected" : ""}>Fumaça</option><option value="midnight" ${petSkin === "midnight" ? "selected" : ""}>Meia-noite</option></select>
+        <select id="pet-skin"><option value="pearl" ${petSkin === "pearl" ? "selected" : ""}>Pérola</option><option value="smoke" ${petSkin === "smoke" ? "selected" : ""}>Fumaça</option><option value="midnight" ${petSkin === "midnight" ? "selected" : ""}>Meia-noite</option><option value="mint" ${petSkin === "mint" ? "selected" : ""}>Menta</option><option value="coral" ${petSkin === "coral" ? "selected" : ""}>Coral</option><option value="lavender" ${petSkin === "lavender" ? "selected" : ""}>Lavanda</option></select>
         <label class="custom-label" for="pet-accessory">Acessório</label>
-        <select id="pet-accessory"><option value="none" ${petAccessory === "none" ? "selected" : ""}>Sem acessório</option><option value="star" ${petAccessory === "star" ? "selected" : ""}>Estrelinha</option><option value="bow" ${petAccessory === "bow" ? "selected" : ""}>Laço</option></select>
+        <select id="pet-accessory"><option value="none" ${petAccessory === "none" ? "selected" : ""}>Sem acessório</option><option value="star" ${petAccessory === "star" ? "selected" : ""}>Estrelinha</option><option value="bow" ${petAccessory === "bow" ? "selected" : ""}>Laço</option><option value="halo" ${petAccessory === "halo" ? "selected" : ""}>Aurora</option><option value="leaf" ${petAccessory === "leaf" ? "selected" : ""}>Folha</option><option value="crown" ${petAccessory === "crown" ? "selected" : ""}>Coroa</option></select>
       </section>`;
   }
   return `
@@ -1008,6 +1683,8 @@ function renderUtilityPopup() {
   }
   const copy: Record<UtilityPopupMode, { title: string; subtitle: string }> = {
     focus: { title: "Foco", subtitle: "Seu tempo, no seu ritmo" },
+    "focus-summary": { title: "Resumo de Foco", subtitle: "Seu ritmo nos últimos sete dias" },
+    "codex-activity": { title: "Atividade do Codex", subtitle: "Contagens locais dos últimos sete dias" },
     pocket: { title: `Bolso do ${petName}`, subtitle: `${pocketItems.length}/8 itens · os originais ficam no lugar` },
     customize: { title: "Personalizar o Ghosty", subtitle: "Nome, aparência e acessório" },
     clipboard: { title: "Prancheta", subtitle: `${clipboardEntries.length} itens recentes` },
@@ -1043,6 +1720,7 @@ function bindUtilityPopup() {
   });
   if (utilityPopupMode === "focus") {
     popup.querySelector("[data-action=focus-toggle]")?.addEventListener("click", startFocus);
+    popup.querySelector("[data-action=focus-summary-open]")?.addEventListener("click", () => void openUtilityPopup("focus-summary"));
     popup.querySelector("[data-action=focus-reset]")?.addEventListener("click", resetFocus);
     popup.querySelector<HTMLInputElement>("#focus-minutes")?.addEventListener("change", (event) => {
       if (focusState.running) return;
@@ -1052,6 +1730,8 @@ function bindUtilityPopup() {
       paintFocusTimer();
     });
   }
+  if (utilityPopupMode === "focus-summary") bindFocusSummary(popup);
+  if (utilityPopupMode === "codex-activity") bindCodexActivityPopup(popup);
   if (utilityPopupMode === "pocket") {
     popup.querySelectorAll<HTMLElement>("[data-dropzone=pocket]").forEach(bindPocketDropzone);
     popup.querySelectorAll<HTMLButtonElement>("[data-action=pocket-clipboard]").forEach((button) => button.addEventListener("click", () => void captureClipboardText(true)));
@@ -1082,6 +1762,33 @@ function bindUtilityPopup() {
       updatePetAtmosphere();
     });
   }
+}
+
+function bindFocusSummary(container: ParentNode) {
+  container.querySelector("[data-action=focus-summary-back]")?.addEventListener("click", () => void openUtilityPopup("focus"));
+  container.querySelector("[data-action=focus-history-clear]")?.addEventListener("click", () => {
+    if (!window.confirm("Apagar todo o histórico de Foco deste dispositivo?")) return;
+    focusHistory = [];
+    persistFocusHistory();
+    paintFocusSummary();
+  });
+}
+
+function paintFocusSummary() {
+  if (utilityPopupMode !== "focus-summary") return;
+  const body = app.querySelector<HTMLElement>(".utility-popup-body");
+  if (!body) return;
+  body.innerHTML = renderFocusSummary();
+  bindFocusSummary(body);
+}
+
+function bindCodexActivityPopup(container: ParentNode) {
+  container.querySelector<HTMLButtonElement>("[data-action=clear-codex-activity]")?.addEventListener("click", () => {
+    if (!window.confirm("Apagar o resumo local de atividade do Codex deste dispositivo?")) return;
+    codexActivity = {};
+    localStorage.setItem(KEYS.codexActivity, JSON.stringify(codexActivity));
+    refreshCodexActivityUi();
+  });
 }
 
 function paintQuickChatMessages(forceToBottom = false) {
@@ -1211,6 +1918,7 @@ function bindQuickChatPopup(popup: HTMLElement) {
   });
   const form = popup.querySelector<HTMLFormElement>("[data-action=quick-chat-form]");
   const input = popup.querySelector<HTMLInputElement>("#quick-chat-input");
+  input?.addEventListener("input", () => { quickChatDraft = input.value; });
   form?.addEventListener("submit", (event) => {
     event.preventDefault();
     void sendQuickChatMessage();
@@ -1548,6 +2256,8 @@ async function sendQuickChatMessage() {
     return;
   }
   if (input) input.value = "";
+  quickChatDraft = "";
+  localStorage.removeItem(KEYS.quickChatDraft);
   quickChatMessages.push({ id: makeId(), role: "user", text: message });
   if (runExplicitQuickChatAction(message)) {
     quickChatError = "";
@@ -1621,6 +2331,8 @@ async function stopQuickChatSession() {
   }
   if (quickChatServiceStarted || quickChatServiceLoading) await invoke("quick_chat_close").catch(() => undefined);
   quickChatMessages = [];
+  quickChatDraft = "";
+  localStorage.removeItem(KEYS.quickChatDraft);
   quickChatApprovals = [];
   quickChatCancelRequested = false;
   quickChatApprovalBusy.clear();
@@ -1659,6 +2371,40 @@ async function openUtilityPopup(mode: UtilityPopupMode) {
   } catch (error) {
     console.error("NÃ£o consegui abrir o popup do Edge Ghosty", error);
   }
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1_024) return `${bytes} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes;
+  let unit = -1;
+  do {
+    value /= 1_024;
+    unit += 1;
+  } while (value >= 1_024 && unit < units.length - 1);
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+async function askAboutPocketItem(item: PocketItem) {
+  if (item.kind === "text") {
+    const text = item.value.slice(0, MAX_CHAT_TEXT_CONTEXT_CHARS);
+    const clipped = item.truncated || item.value.length > MAX_CHAT_TEXT_CONTEXT_CHARS;
+    quickChatDraft = `Ajude-me a entender este texto que guardei no Bolso do Ghosty${clipped ? ` (estou enviando somente os primeiros ${MAX_CHAT_TEXT_CONTEXT_CHARS.toLocaleString("pt-BR")} caracteres)` : ""}:\n\n${text}`;
+  } else {
+    let sizeNote = "Não consegui consultar o tamanho local; confirme o arquivo antes de autorizar qualquer leitura.";
+    try {
+      const metadata = await invoke<{ sizeBytes: number }>("pocket_file_metadata", { path: item.value });
+      const readableSize = formatFileSize(metadata.sizeBytes);
+      sizeNote = metadata.sizeBytes > LARGE_CHAT_FILE_WARNING_BYTES
+        ? `Tamanho local: ${readableSize}. Este arquivo ultrapassa o limite recomendado de 25 MiB para análise no chat. Não tente ler o arquivo inteiro; pergunte ao usuário se prefere fornecer uma cópia menor ou um trecho.`
+        : `Tamanho local: ${readableSize}. O arquivo não será enviado automaticamente.`;
+    } catch {
+      // Keep the handoff available when metadata cannot be read; the chat still requires explicit approval for file access.
+    }
+    quickChatDraft = `Analise o arquivo que guardei no Bolso do Ghosty: ${item.name}\nCaminho: ${item.value}\n${sizeNote}\nNão altere nem copie o original. Se precisar acessar o conteúdo, peça permissão pelo Ghosty antes de ler.`;
+  }
+  localStorage.setItem(KEYS.quickChatDraft, quickChatDraft);
+  void openUtilityPopup("chat");
 }
 
 async function closeUtilityPopup() {
@@ -1756,10 +2502,171 @@ function renderShortcutsPage() {
     </div>`;
 }
 
+function renderOnboarding() {
+  if (onboardingStep === "welcome") {
+    return `
+      <section class="onboarding-page onboarding-welcome">
+        <div class="onboarding-step-label">CONFIGURAÇÃO RÁPIDA <span>1 DE 2</span></div>
+        <div class="onboarding-welcome-row">
+          ${renderPetCharacter("onboarding-pet")}
+          <div><h1>Vamos preparar seu Ghosty</h1><p>Em menos de um minuto, escolha como ele aparece no seu dia a dia.</p></div>
+        </div>
+        <div class="onboarding-benefits">
+          <div><span>HOME</span><p>Controle mídia e volume sem sair do que está fazendo.</p></div>
+          <div><span>FOCO</span><p>Inicie um temporizador e acompanhe seu ritmo semanal.</p></div>
+          <div><span>ATALHOS</span><p>Abra seus aplicativos, arquivos e sites favoritos.</p></div>
+        </div>
+        <div class="onboarding-actions">
+          <button class="onboarding-primary" data-action="onboarding-next">Configurar agora <span>→</span></button>
+          <button class="onboarding-skip" data-action="onboarding-skip">Pular por enquanto</button>
+        </div>
+      </section>`;
+  }
+
+  const shortcutOptions = shortcuts.map((shortcut) => `
+    <label class="onboarding-shortcut-option">
+      <input type="checkbox" data-onboarding-shortcut="${escapeHtml(shortcut.id)}" ${onboardingSelectedShortcutIds.has(shortcut.id) ? "checked" : ""} />
+      <span class="onboarding-shortcut-glyph">${escapeHtml(shortcut.glyph)}</span>
+      <span>${escapeHtml(shortcut.name)}</span>
+    </label>`).join("");
+  return `
+    <section class="onboarding-page onboarding-choices">
+      <div class="onboarding-step-label"><button data-action="onboarding-back" aria-label="Voltar">←</button> CONFIGURAÇÃO RÁPIDA <span>2 DE 2</span></div>
+      <h1>Deixe tudo pronto</h1>
+      <p class="onboarding-lead">Você pode mudar estas escolhas depois nas Configurações e em Atalhos.</p>
+      <label class="onboarding-startup-option">
+        <input type="checkbox" data-autostart-toggle ${autoStartEnabled ? "checked" : ""} ${autoStartLoading || autoStartBusy ? "disabled" : ""} />
+        <span><strong>Iniciar com o Windows</strong><small>O Ghosty estará disponível quando você entrar no computador.</small></span>
+      </label>
+      <small class="onboarding-status" data-autostart-status role="status">${escapeHtml(autoStartStatusText())}</small>
+      <div class="onboarding-shortcut-heading"><strong>Atalhos da Home</strong><small data-onboarding-shortcut-status>${onboardingSelectedShortcutIds.size} de 3 selecionados</small></div>
+      <p class="onboarding-shortcut-hint">Escolha até três. Os demais continuam disponíveis em Atalhos.</p>
+      <div class="onboarding-shortcut-list">${shortcutOptions || '<small>Adicione seus atalhos em Atalhos depois da configuração.</small>'}</div>
+      <small class="onboarding-status onboarding-shortcut-message" data-onboarding-message role="status"></small>
+      <div class="onboarding-actions">
+        <button class="onboarding-primary" data-action="onboarding-finish" ${autoStartBusy ? "disabled" : ""}>Salvar e começar <span>→</span></button>
+      </div>
+    </section>`;
+}
+
 function renderActiveTab() {
+  if (onboardingOpen) return renderOnboarding();
   if (activeTab === "pet") return renderPetPage();
   if (activeTab === "shortcuts") return renderShortcutsPage();
   return renderHomePage();
+}
+
+function autoStartStatusText() {
+  if (autoStartLoading) return "Verificando a configuração do Windows…";
+  if (autoStartBusy) return "Salvando…";
+  if (autoStartError) return autoStartError;
+  return autoStartEnabled ? "Ativado para sua conta do Windows." : "Desativado. Você pode ativar quando quiser.";
+}
+
+function paintAutoStartControls() {
+  app.querySelectorAll<HTMLInputElement>("[data-autostart-toggle]").forEach((input) => {
+    input.checked = autoStartEnabled;
+    input.disabled = autoStartLoading || autoStartBusy;
+  });
+  app.querySelectorAll<HTMLElement>("[data-autostart-status]").forEach((status) => {
+    status.textContent = autoStartStatusText();
+    status.classList.toggle("is-error", !!autoStartError);
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-action=onboarding-finish]").forEach((button) => {
+    button.disabled = autoStartBusy;
+  });
+}
+
+async function refreshAutoStartStatus() {
+  autoStartLoading = true;
+  autoStartError = "";
+  paintAutoStartControls();
+  try {
+    autoStartEnabled = await invoke<boolean>("is_autostart_enabled");
+  } catch (error) {
+    autoStartError = `Não foi possível consultar a inicialização: ${String(error)}`;
+  } finally {
+    autoStartLoading = false;
+    paintAutoStartControls();
+  }
+}
+
+async function setAutoStartEnabled(enabled: boolean) {
+  if (autoStartBusy || autoStartLoading) return;
+  autoStartBusy = true;
+  autoStartError = "";
+  paintAutoStartControls();
+  try {
+    await invoke("set_autostart_enabled", { enabled });
+    autoStartEnabled = enabled;
+  } catch (error) {
+    autoStartError = `Não foi possível salvar: ${String(error)}`;
+  } finally {
+    autoStartBusy = false;
+    paintAutoStartControls();
+  }
+}
+
+function finishOnboarding(applyChoices: boolean) {
+  if (applyChoices) {
+    const selected = shortcuts.filter((shortcut) => onboardingSelectedShortcutIds.has(shortcut.id));
+    shortcuts = [...selected, ...shortcuts.filter((shortcut) => !onboardingSelectedShortcutIds.has(shortcut.id))];
+    persistShortcuts();
+  }
+  localStorage.setItem(KEYS.onboardingComplete, "true");
+  onboardingOpen = false;
+  onboardingStep = "welcome";
+  activeTab = "home";
+  settingsOpen = false;
+  render();
+  setExpanded(false);
+}
+
+function openOnboarding() {
+  onboardingOpen = true;
+  onboardingStep = "welcome";
+  onboardingSelectedShortcutIds = new Set(shortcuts.slice(0, 3).map((shortcut) => shortcut.id));
+  settingsOpen = false;
+  activeTab = "home";
+  render();
+  setExpanded(true);
+}
+
+function bindOnboarding(container: HTMLElement) {
+  if (!onboardingOpen) return;
+  container.querySelector("[data-action=onboarding-next]")?.addEventListener("click", () => {
+    onboardingStep = "choices";
+    container.innerHTML = renderOnboarding();
+    bindTabContent(container);
+  });
+  container.querySelector("[data-action=onboarding-back]")?.addEventListener("click", () => {
+    onboardingStep = "welcome";
+    container.innerHTML = renderOnboarding();
+    bindTabContent(container);
+  });
+  container.querySelector("[data-action=onboarding-skip]")?.addEventListener("click", () => finishOnboarding(false));
+  container.querySelector("[data-action=onboarding-finish]")?.addEventListener("click", () => finishOnboarding(true));
+  container.querySelectorAll<HTMLInputElement>("[data-autostart-toggle]").forEach((input) => {
+    input.addEventListener("change", () => void setAutoStartEnabled(input.checked));
+  });
+  container.querySelectorAll<HTMLInputElement>("[data-onboarding-shortcut]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const id = input.dataset.onboardingShortcut;
+      if (!id) return;
+      const status = container.querySelector<HTMLElement>("[data-onboarding-shortcut-status]");
+      const message = container.querySelector<HTMLElement>("[data-onboarding-message]");
+      if (input.checked && onboardingSelectedShortcutIds.size >= 3) {
+        input.checked = false;
+        if (message) message.textContent = "Escolha até três atalhos para a Home.";
+        return;
+      }
+      if (input.checked) onboardingSelectedShortcutIds.add(id);
+      else onboardingSelectedShortcutIds.delete(id);
+      if (status) status.textContent = `${onboardingSelectedShortcutIds.size} de 3 selecionados`;
+      if (message) message.textContent = "";
+    });
+  });
+  paintAutoStartControls();
 }
 
 function setPetMood(mood: string, durationMs = 1400) {
@@ -1787,6 +2694,7 @@ function setCodexTaskRunning(running: boolean) {
   codexTaskRunning = running;
   const island = app.querySelector<HTMLElement>(".edge-island");
   island?.classList.toggle("is-task-running", running);
+  app.querySelectorAll<HTMLElement>(".codex-live-indicator").forEach((indicator) => indicator.classList.toggle("is-active", running));
   if (running) island?.classList.remove("is-task-complete");
   island?.querySelector(".peek-line")?.setAttribute(
     "aria-label",
@@ -1909,6 +2817,7 @@ function queueCodexApproval(event: CodexHookEvent) {
   if (!event.approvalId || !event.approvalDescription || pendingCodexApprovals.some((item) => item.requestId === event.approvalId)) return;
   const expiresAt = event.approvalExpiresAt ?? event.occurredAt + 570_000;
   if (expiresAt <= Date.now()) return;
+  playGhostySound("approval");
   pendingCodexApprovals.push({
     requestId: event.approvalId,
     toolName: event.toolName || "Codex",
@@ -1976,25 +2885,49 @@ function updateCodexIntegrationControls() {
   const status = app.querySelector<HTMLElement>("#codex-hooks-status");
   if (button) {
     button.disabled = codexHooksBusy;
-    button.textContent = codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex";
+    button.textContent = codexHooksBusy ? "Aguarde…" : codexHooksEnabled
+      ? codexHooksNeedsReview ? "Revisar atualização" : "Desconectar Codex"
+      : "Conectar Codex";
   }
   if (status) status.textContent = codexHooksStatusMessage;
+}
+
+function renderCodexHookPreview() {
+  if (!codexHookPreview) return "";
+  const preview = codexHookPreview;
+  const changes = preview.changes.length
+    ? preview.changes.map((change) => {
+      const before = change.before.length ? JSON.stringify(change.before, null, 2) : "(nenhum hook do Ghosty)";
+      const after = change.after.length ? JSON.stringify(change.after, null, 2) : "(nenhum hook do Ghosty)";
+      return `<details class="codex-hook-event-change"><summary>${escapeHtml(change.eventName)} · ${change.before.length ? "atualizar/remover" : "adicionar"}</summary><div class="codex-hook-diff"><section><small>ANTES</small><pre>${escapeHtml(before)}</pre></section><section><small>DEPOIS</small><pre>${escapeHtml(after)}</pre></section></div></details>`;
+    }).join("")
+    : '<p class="settings-note">Nenhuma entrada do Ghosty em hooks.json precisa mudar. A confirmação só atualiza o helper local e o estado da conexão.</p>';
+  const action = preview.enabled ? "conectar" : "desconectar";
+  return `<div class="codex-hook-preview" role="region" aria-label="Revisão da integração com Codex">
+    <strong>Revisar ${action} o Codex</strong>
+    <small class="codex-hook-config-path">${escapeHtml(preview.configPath)}</small>
+    <p>${preview.configChanged ? `Esta alteração modifica somente os hooks do Ghosty nos eventos listados. Os demais hooks serão preservados.` : "O hooks.json não será alterado nesta operação."}</p>
+    ${preview.backupWillBeCreated ? '<p class="codex-hook-backup-note">Antes de gravar, criarei um backup datado do hooks.json.</p>' : ""}
+    <div class="codex-hook-change-list">${changes}</div>
+    <small>Confirme para aplicar. Se o arquivo mudar depois desta prévia, o Ghosty cancela a gravação e pede uma nova revisão.</small>
+    <div class="codex-hook-preview-actions"><button class="reset-button" data-action="codex-hook-apply" ${codexHooksBusy ? "disabled" : ""}>Confirmar ${action}</button><button class="text-button" data-action="codex-hook-cancel" ${codexHooksBusy ? "disabled" : ""}>Cancelar</button></div>
+  </div>`;
 }
 
 async function refreshCodexHooksStatus() {
   try {
     codexHooksEnabled = await invoke<boolean>("codex_hooks_enabled");
-    let updated = false;
+    codexHooksNeedsReview = false;
     if (codexHooksEnabled) {
-      const sync = await invoke<{ enabled: boolean; updated: boolean }>("sync_codex_hooks_if_enabled");
-      codexHooksEnabled = sync.enabled;
-      updated = sync.updated;
+      const reviewState = await invoke<{ enabled: boolean; needsReview: boolean }>("codex_hooks_review_state");
+      codexHooksEnabled = reviewState.enabled;
+      codexHooksNeedsReview = reviewState.needsReview;
     }
     if (!codexHooksEnabled) setCodexTaskRunning(false);
     codexHooksStatusMessage = codexHooksEnabled
-      ? updated
-        ? "Atualizei o hook. Reinicie o Codex e aprove o hook do Ghosty se solicitado."
-        : "Hook configurado. Reinicie o Codex para aplicar as respostas de aprovação pelo Ghosty."
+      ? codexHooksNeedsReview
+        ? "Há uma atualização do hook para revisar. Nada será alterado até você confirmar."
+        : "Hook conectado. Reinicie o Codex para garantir que a configuração atual seja carregada."
       : "Desativado. O Ghosty não acompanha sessões do Codex.";
   } catch (error) {
     codexHooksStatusMessage = `Não consegui consultar o Codex: ${String(error)}`;
@@ -2006,28 +2939,58 @@ async function refreshCodexHooksStatus() {
 
 async function toggleCodexHooks() {
   if (codexHooksBusy) return;
-  const enabled = !codexHooksEnabled;
+  const enabled = codexHooksEnabled && codexHooksNeedsReview ? true : !codexHooksEnabled;
   codexHooksBusy = true;
-  codexHooksStatusMessage = enabled ? "Configurando o hook local…" : "Removendo o hook do Codex…";
+  codexHooksStatusMessage = "Lendo a configuração atual para preparar a revisão…";
   updateCodexIntegrationControls();
   try {
-    codexHooksEnabled = await invoke<boolean>("set_codex_hooks_enabled", { enabled });
-    if (!codexHooksEnabled) {
-      setCodexTaskRunning(false);
-      clearPendingCodexApprovals();
-    }
-    codexHooksStatusMessage = codexHooksEnabled
-      ? "Hook configurado. Reinicie o Codex e aprove a atualização do hook do Ghosty se solicitado."
-      : "Desconectado agora. Reinicie o Codex para descarregar o hook; os outros hooks foram preservados.";
+    codexHookPreview = await invoke<CodexHookPreview>("codex_hooks_preview", { enabled });
+    codexHooksStatusMessage = "Confira as entradas que serão alteradas antes de continuar.";
   } catch (error) {
     codexHooksStatusMessage = `Não consegui atualizar o Codex: ${String(error)}`;
   } finally {
     codexHooksBusy = false;
-    updateCodexIntegrationControls();
+    render();
+  }
+}
+
+async function applyCodexHookChange() {
+  const preview = codexHookPreview;
+  if (!preview || codexHooksBusy) return;
+  codexHooksBusy = true;
+  codexHooksStatusMessage = "Aplicando a alteração revisada…";
+  updateCodexIntegrationControls();
+  try {
+    const result = await invoke<{ enabled: boolean; backupPath: string | null }>("apply_codex_hooks_change", {
+      enabled: preview.enabled,
+      expectedFingerprint: preview.fingerprint,
+    });
+    codexHooksEnabled = result.enabled;
+    codexHooksNeedsReview = false;
+    codexHookPreview = null;
+    if (!codexHooksEnabled) {
+      setCodexTaskRunning(false);
+      clearPendingCodexApprovals();
+      codexHooksStatusMessage = result.backupPath
+        ? `Desconectado. Backup criado em ${result.backupPath}. Reinicie o Codex para descarregar a configuração antiga.`
+        : "Desconectado. Reinicie o Codex para descarregar a configuração antiga.";
+    } else {
+      codexHooksStatusMessage = result.backupPath
+        ? `Conectado. Backup criado em ${result.backupPath}. Reinicie o Codex para carregar os hooks revisados.`
+        : "Conectado. Reinicie o Codex para carregar os hooks revisados.";
+    }
+  } catch (error) {
+    codexHooksNeedsReview = true;
+    codexHookPreview = null;
+    codexHooksStatusMessage = `Não apliquei a alteração: ${String(error).replace(/^Error: /, "")}`;
+  } finally {
+    codexHooksBusy = false;
+    render();
   }
 }
 
 function applyCodexHookEvents(events: CodexHookEvent[]) {
+  recordCodexActivity(events);
   for (const event of events) {
     switch (event.eventName) {
       case "SessionStart":
@@ -2180,6 +3143,7 @@ function addPocketItem(item: PocketItem, origin?: { x: number; y: number }) {
     morsel.style.setProperty("--morsel-y", `${end.y - start.y}px`);
     document.body.append(morsel);
     petMotionEngines.get(pet)?.gulp();
+    playGhostySound("ingest");
     pocketNotice = `${petName} está comendo…`;
     const petHint = app.querySelector<HTMLElement>(".pet-profile-hint");
     if (petHint) petHint.textContent = `${petName} está comendo ${item.name}`;
@@ -2254,13 +3218,20 @@ async function copyClipboardText(text: string) {
 function startFocus() {
   const remaining = focusRemainingMs();
   if (focusState.running) {
+    if (remaining === 0) {
+      finishFocus();
+      return;
+    }
+    recordFocusSegment(false);
     focusState.running = false;
     focusState.remainingMs = remaining;
     focusState.endsAt = 0;
+    focusState.startedAt = 0;
   } else {
     const duration = Math.max(1, Math.min(180, Number(app.querySelector<HTMLInputElement>("#focus-minutes")?.value) || Math.round(focusState.durationMs / 60_000))) * 60_000;
     focusState.durationMs = duration;
     focusState.remainingMs = remaining > 0 ? remaining : duration;
+    focusState.startedAt = Date.now();
     focusState.endsAt = Date.now() + focusState.remainingMs;
     focusState.running = true;
     petMoodOverride = "";
@@ -2270,8 +3241,10 @@ function startFocus() {
 }
 
 function resetFocus() {
+  if (focusState.running) recordFocusSegment(false);
   focusState.running = false;
   focusState.endsAt = 0;
+  focusState.startedAt = 0;
   focusState.remainingMs = focusState.durationMs;
   persistFocus();
   paintFocusTimer();
@@ -2295,21 +3268,24 @@ function paintFocusTimer() {
 }
 
 function finishFocus() {
+  recordFocusSegment(true);
   focusState.running = false;
   focusState.remainingMs = 0;
   focusState.endsAt = 0;
+  focusState.startedAt = 0;
   persistFocus();
   setPetMood("happy", 12_000);
+  playGhostySound("complete");
   paintFocusTimer();
   app.querySelectorAll<HTMLElement>(".pet").forEach((pet) => petMotionEngines.get(pet)?.setState("finished"));
 }
 
 function tickFeatures() {
   if (focusState.running) {
-    if (focusRemainingMs() === 0) finishFocus();
+    if (focusRemainingMs() === 0 && currentWindowLabel === "main") finishFocus();
     else {
       paintFocusTimer();
-      if (Date.now() % 5000 < 1000) persistFocus();
+      if (currentWindowLabel === "main" && Date.now() % 5000 < 1000) persistFocus();
     }
   }
   if (petMoodOverride && Date.now() >= petMoodUntil) {
@@ -2567,8 +3543,9 @@ function bindTabContent(tabView: HTMLElement) {
 
   tabView.querySelectorAll<HTMLButtonElement>("[data-action=open-utility-popup]").forEach((button) => button.addEventListener("click", () => {
     const mode = button.dataset.popup;
-    if (mode === "focus" || mode === "pocket" || mode === "customize" || mode === "clipboard") void openUtilityPopup(mode);
+    if (mode === "focus" || mode === "focus-summary" || mode === "codex-activity" || mode === "pocket" || mode === "customize" || mode === "clipboard" || mode === "chat") void openUtilityPopup(mode);
   }));
+  bindGithubActions(tabView);
 
   const form = tabView.querySelector<HTMLFormElement>("[data-action=shortcut-form]");
   form?.addEventListener("submit", (event) => {
@@ -2625,9 +3602,14 @@ function bindTabContent(tabView: HTMLElement) {
     });
   }
   updatePetAtmosphere();
+  bindOnboarding(tabView);
 }
 
 function bindPocketItemActions(container: ParentNode) {
+  container.querySelectorAll<HTMLButtonElement>("[data-action=ask-pocket]").forEach((button) => button.addEventListener("click", () => {
+    const item = pocketItems.find((entry) => entry.id === button.dataset.pocketId);
+    if (item) askAboutPocketItem(item);
+  }));
   container.querySelectorAll<HTMLButtonElement>("[data-action=open-pocket]").forEach((button) => button.addEventListener("click", () => {
     const item = pocketItems.find((entry) => entry.id === button.dataset.pocketId);
     if (!item) return;
@@ -2758,6 +3740,14 @@ function renderSettingsContent() {
           <div class="display-list">${renderDisplayOptions()}</div>
         </section>
         <section class="control-card setting-card">
+          <div class="setting-heading">Inicialização do Windows</div>
+          <label class="display-option startup-setting-option">
+            <input type="checkbox" data-autostart-toggle ${autoStartEnabled ? "checked" : ""} ${autoStartLoading || autoStartBusy ? "disabled" : ""} />
+            <span><strong>Iniciar com o Windows</strong><small>Disponível quando você entrar na sua conta.</small></span>
+          </label>
+          <small class="settings-note autostart-status" data-autostart-status role="status">${escapeHtml(autoStartStatusText())}</small>
+        </section>
+        <section class="control-card setting-card">
           <div class="setting-heading"><label for="close-delay">Tempo para recolher</label><output id="close-delay-value">${closeDelay} ms</output></div>
           <input id="close-delay" type="range" min="${MIN_CLOSE_DELAY}" max="${MAX_CLOSE_DELAY}" step="50" value="${closeDelay}" />
           <div class="range-labels"><span>imediato</span><span>mais lento</span></div>
@@ -2766,9 +3756,46 @@ function renderSettingsContent() {
           <div class="setting-heading">Ghosty e Codex</div>
           <p class="codex-integration-copy">Nas sessões locais do Codex, as bolinhas indicam atividade e o Ghosty mostra pedidos de aprovação e conclusões. Os hooks não capturam prompts, respostas ou resultados de ferramentas.</p>
           <small class="codex-integration-status" id="codex-hooks-status" role="status">${escapeHtml(codexHooksStatusMessage)}</small>
-          <button class="reset-button codex-integration-toggle" id="codex-hooks-toggle" type="button" ${codexHooksBusy ? "disabled" : ""}>${codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? "Desconectar Codex" : "Conectar Codex"}</button>
+          <button class="reset-button codex-integration-toggle" id="codex-hooks-toggle" type="button" ${codexHooksBusy ? "disabled" : ""}>${codexHooksBusy ? "Aguarde…" : codexHooksEnabled ? codexHooksNeedsReview ? "Revisar atualização" : "Desconectar Codex" : "Conectar Codex"}</button>
+          ${renderCodexHookPreview()}
+        </section>
+        <section class="control-card setting-card github-integration-card">
+          <div class="setting-heading">GitHub</div>
+          <p class="settings-note">Acompanhe PRs, revisões pedidas e CI. Prefira um token fine-grained com Metadata e Pull requests em leitura; Checks e Commit statuses permitem mostrar o CI. O token fica no Gerenciador de Credenciais do Windows.</p>
+          <form class="github-token-form" id="github-token-form">
+            <label class="visually-hidden" for="github-token">Token pessoal do GitHub</label>
+            <input id="github-token" type="password" maxlength="2400" autocomplete="new-password" spellcheck="false" placeholder="github_pat_…" aria-label="Token pessoal do GitHub" />
+            <button class="reset-button" data-action="github-save-token" type="submit">Conectar</button>
+          </form>
+          <small class="github-settings-status" data-github-status role="status">${escapeHtml(githubStatusMessage)}</small>
+          <div class="github-settings-actions">
+            <button class="text-button" data-action="github-token-help" type="button">Criar token de leitura ↗</button>
+            <button class="text-button" data-action="github-clear-token" type="button" ${githubConnected ? "" : "hidden"}>Desconectar</button>
+          </div>
+        </section>
+        <section class="control-card setting-card vercel-integration-card">
+          <div class="setting-heading">Vercel</div>
+          <p class="settings-note">Consulte as cinco implantações recentes da conta pessoal ou equipe. O Ghosty não inicia nem cancela implantações. O token fica no Gerenciador de Credenciais do Windows; atualizações param quando você pausa pela bandeja.</p>
+          <form class="github-token-form" id="vercel-token-form">
+            <label class="visually-hidden" for="vercel-token">Token pessoal da Vercel</label>
+            <input id="vercel-token" type="password" maxlength="2048" autocomplete="new-password" spellcheck="false" placeholder="Token da Vercel" aria-label="Token pessoal da Vercel" />
+            <button class="reset-button" data-action="vercel-save-token" type="submit" ${updatesPaused ? "disabled" : ""}>Conectar</button>
+          </form>
+          <label class="vercel-team-field" for="vercel-team-id"><span>Equipe (opcional)</span><input id="vercel-team-id" type="text" maxlength="120" autocomplete="off" spellcheck="false" value="${escapeHtml(vercelTeamId)}" placeholder="team_…" /><small>Deixe vazio para consultar a conta pessoal.</small></label>
+          <small class="github-settings-status" data-vercel-status role="status">${escapeHtml(vercelStatusMessage)}</small>
+          <div class="github-settings-actions">
+            <button class="text-button" data-action="vercel-token-help" type="button">Criar token da Vercel ↗</button>
+            <button class="text-button" data-action="vercel-clear-token" type="button" ${vercelConnected ? "" : "hidden"}>Desconectar</button>
+          </div>
+        </section>
+        <section class="control-card setting-card sound-settings-card">
+          <div class="setting-heading">Sons do Ghosty</div>
+          <label class="display-option"><input id="sound-enabled" type="checkbox" ${soundEnabled ? "checked" : ""} /><span><strong>Ativar sons discretos</strong><small>Toques curtos em interações, ingestão e conclusão.</small></span></label>
+          <label class="sound-volume-setting" for="sound-volume"><span>Volume dos sons</span><output id="sound-volume-value">${soundVolume}%</output></label>
+          <input id="sound-volume" type="range" min="0" max="100" value="${soundVolume}" ${soundEnabled ? "" : "disabled"} />
         </section>
         <p class="settings-note">As curvas do notch acompanham o comprimento e a orientação da barrinha.</p>
+        <button class="reset-button" data-action="reopen-onboarding">Abrir assistente de configuração</button>
         <button class="reset-button" data-action="reset-settings">Restaurar configurações padrão</button>
         </section>
       </div>
@@ -2833,6 +3860,57 @@ function bindRange(
 
 function bindSettings() {
   app.querySelector<HTMLButtonElement>("#codex-hooks-toggle")?.addEventListener("click", () => void toggleCodexHooks());
+  app.querySelector<HTMLButtonElement>("[data-action=codex-hook-apply]")?.addEventListener("click", () => void applyCodexHookChange());
+  app.querySelector<HTMLButtonElement>("[data-action=codex-hook-cancel]")?.addEventListener("click", () => {
+    codexHookPreview = null;
+    codexHooksStatusMessage = codexHooksNeedsReview
+      ? "Atualização pendente. Nada foi alterado; revise quando quiser."
+      : codexHooksEnabled ? "Hook conectado." : "Desativado. O Ghosty não acompanha sessões do Codex.";
+    render();
+  });
+  app.querySelector<HTMLFormElement>("#github-token-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveGithubToken();
+  });
+  app.querySelector<HTMLFormElement>("#vercel-token-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveVercelToken();
+  });
+  app.querySelector<HTMLButtonElement>("[data-action=vercel-clear-token]")?.addEventListener("click", () => void clearVercelToken());
+  app.querySelector<HTMLButtonElement>("[data-action=vercel-token-help]")?.addEventListener("click", () => {
+    void invoke("open_targets", { targets: ["https://vercel.com/account/tokens"] }).catch(() => undefined);
+  });
+  app.querySelector<HTMLInputElement>("#vercel-team-id")?.addEventListener("change", (event) => {
+    vercelTeamId = (event.currentTarget as HTMLInputElement).value.trim();
+    localStorage.setItem(KEYS.vercelTeamId, vercelTeamId);
+    vercelSnapshot = null;
+    if (vercelConnected && !updatesPaused) void refreshVercelSnapshot();
+  });
+  app.querySelector<HTMLButtonElement>("[data-action=github-clear-token]")?.addEventListener("click", () => void clearGithubToken());
+  app.querySelector<HTMLButtonElement>("[data-action=github-token-help]")?.addEventListener("click", () => {
+    void invoke("open_targets", { targets: ["https://github.com/settings/personal-access-tokens/new"] }).catch(() => undefined);
+  });
+  app.querySelector<HTMLInputElement>("#sound-enabled")?.addEventListener("change", (event) => {
+    soundEnabled = (event.target as HTMLInputElement).checked;
+    localStorage.setItem(KEYS.soundsEnabled, String(soundEnabled));
+    setGhostySoundEnabled(soundEnabled);
+    const slider = app.querySelector<HTMLInputElement>("#sound-volume");
+    if (slider) slider.disabled = !soundEnabled;
+    if (soundEnabled) playGhostySound("tap");
+  });
+  app.querySelector<HTMLInputElement>("#sound-volume")?.addEventListener("input", (event) => {
+    soundVolume = Number((event.target as HTMLInputElement).value);
+    localStorage.setItem(KEYS.soundVolume, String(soundVolume));
+    setGhostySoundVolume(soundVolume / 100);
+    const output = app.querySelector<HTMLOutputElement>("#sound-volume-value");
+    if (output) output.value = `${soundVolume}%`;
+  });
+  if (settingsOpen) {
+    app.querySelector<HTMLInputElement>("[data-autostart-toggle]")?.addEventListener("change", (event) => {
+      void setAutoStartEnabled((event.target as HTMLInputElement).checked);
+    });
+  }
+  app.querySelector<HTMLButtonElement>("[data-action=reopen-onboarding]")?.addEventListener("click", openOnboarding);
   bindRange("#bar-length", (value) => { barLength = value; }, "#bar-length-value", (value) => `${value} px`);
   bindRange("#bar-thickness", (value) => { barThickness = value; }, "#bar-thickness-value", (value) => `${value} px`);
   bindRange("#close-delay", (value) => { closeDelay = value; }, "#close-delay-value", (value) => `${value} ms`);
@@ -2880,23 +3958,24 @@ function bindCodexApprovalButtons(container: ParentNode) {
 
 function render() {
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
         <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
         <div class="island-content">
           <header class="menu-header">
-            <nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
+            ${onboardingOpen ? '<div class="onboarding-brand">EDGE GHOSTY</div>' : `<nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
               <button class="icon-button menu-tab ${activeTab === "home" ? "is-active" : ""}" aria-pressed="${activeTab === "home"}" data-tab="home" aria-label="Início" title="Início">${menuIcon("home")}</button>
               <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">${menuIcon("pet")}</button>
               <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
-            </nav>
-            <div class="menu-header-actions">
+            </nav>`}
+            ${onboardingOpen ? "" : `<div class="header-title"><strong>EDGE GHOSTY</strong><small>${activeTab === "home" ? "Visão geral" : activeTab === "pet" ? petName : "Atalhos"}${updatesPaused ? " · pausado" : ""}</small></div>`}
+            ${onboardingOpen ? "" : `<div class="menu-header-actions">
               <button class="icon-button settings-button" data-action="settings" aria-label="Abrir configurações" title="Configurações">${menuIcon("settings")}</button>
               <button class="icon-button close-button" data-action="close" aria-label="Fechar" title="Fechar">${menuIcon("close")}</button>
-            </div>
+            </div>`}
           </header>
           <main class="tab-view" role="tabpanel">${renderActiveTab()}</main>
-          <footer><span>Ctrl + Shift + Espaço</span><span class="footer-hint">chat rápido do Ghosty</span></footer>
+          ${onboardingOpen ? "" : '<footer><span>Ctrl + Shift + Espaço</span><span class="footer-hint">chat rápido do Ghosty</span></footer>'}
         </div>
         <div class="ghosty-inline-approval" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ghosty-inline-approval-title">
           ${renderPetCharacter("ghosty-inline-approval-pet")}
@@ -3018,7 +4097,21 @@ function render() {
 
 async function startMainWindow() {
   render();
+  void refreshAutoStartStatus();
   void refreshCodexHooksStatus();
+  try { updatesPaused = await invoke<boolean>("is_updates_paused"); } catch { /* Tray not initialized in older app builds. */ }
+  void refreshGithubStatus();
+  void refreshVercelStatus();
+  if (githubRefreshInterval === undefined) {
+    githubRefreshInterval = window.setInterval(() => {
+      if (githubConnected && !updatesPaused) void refreshGithubSnapshot();
+    }, 5 * 60_000);
+  }
+  if (vercelRefreshInterval === undefined) {
+    vercelRefreshInterval = window.setInterval(() => {
+      if (vercelConnected && !updatesPaused) void refreshVercelSnapshot();
+    }, 5 * 60_000);
+  }
   window.setInterval(() => void pollCodexHookEvents(), 300);
   await bindNativeFileDrop();
   void invoke<number>("get_system_volume").then((value) => {
@@ -3043,7 +4136,7 @@ async function startMainWindow() {
     }
     persistSettings();
     render();
-    await applyDisplayLayout(false);
+    await applyDisplayLayout(expanded);
   } catch {
     // Keep the notch usable if monitor enumeration is temporarily unavailable.
   }
@@ -3081,7 +4174,6 @@ void listen<CursorPosition>("edge-ghosty-cursor", ({ payload }) => {
   wasPointerInNativeIsland = inIsland;
 });
 
-const currentWindowLabel = getCurrentWindow().label;
 void listen<QuickChatEvent>("edge-ghosty-quick-chat-event", ({ payload }) => {
   if (utilityPopupMode !== "chat") return;
   const params = payload.params ?? {};
@@ -3211,13 +4303,90 @@ void listen<QuickChatEvent>("edge-ghosty-quick-chat-event", ({ payload }) => {
 });
 if (currentWindowLabel === "main") {
   void listen("edge-ghosty-quick-chat", () => { void openUtilityPopup("chat"); });
+  void listen<string>("edge-ghosty-tray-command", async ({ payload }) => {
+    if (payload !== "open" && payload !== "settings") return;
+    settingsOpen = payload === "settings";
+    await getCurrentWindow().show().catch(() => undefined);
+    if (settingsOpen) render();
+    await getCurrentWindow().setFocus().catch(() => undefined);
+    setExpanded(true);
+  });
 }
+void listen<boolean>("edge-ghosty-pause-updated", ({ payload }) => {
+  updatesPaused = payload;
+  if (payload) {
+    githubStatusMessage = "Atualizações pausadas pela bandeja do sistema.";
+    vercelStatusMessage = "Atualizações pausadas pela bandeja do sistema.";
+  } else {
+    if (githubConnected) githubStatusMessage = `Conectado como @${githubSnapshot?.login ?? "GitHub"}.`;
+    if (vercelConnected) vercelStatusMessage = `Conectado à Vercel${vercelSnapshot ? ` como ${vercelSnapshot.username}` : ""}.`;
+  }
+  refreshGithubCard();
+  refreshGithubSettingsUi();
+  refreshVercelSettingsUi();
+  if (!payload) {
+    if (githubConnected) void refreshGithubSnapshot();
+    if (vercelConnected) void refreshVercelSnapshot();
+  }
+});
+void listen<GithubSnapshot | null>("edge-ghosty-github-snapshot", ({ payload }) => {
+  githubSnapshot = payload;
+  if (payload) {
+    githubConnected = true;
+    githubStatusMessage = `Conectado como @${payload.login}.`;
+  } else {
+    githubConnected = false;
+    githubStatusMessage = "GitHub desconectado.";
+  }
+  refreshGithubCard();
+  refreshGithubSettingsUi();
+});
+void listen<VercelSnapshot | null>("edge-ghosty-vercel-snapshot", ({ payload }) => {
+  vercelSnapshot = payload;
+  if (payload) {
+    vercelConnected = true;
+    vercelStatusMessage = `Conectado à Vercel como ${payload.username}.`;
+  } else {
+    vercelConnected = false;
+    vercelStatusMessage = "Vercel desconectada.";
+  }
+  refreshGithubCard();
+  refreshVercelSettingsUi();
+});
 if (currentWindowLabel === "utility-popup") window.setInterval(() => {
   if (utilityPopupMode === "focus") paintFocusTimer();
 }, 250);
 else window.setInterval(tickFeatures, 1000);
 
 window.addEventListener("storage", (event) => {
+  if (event.key === KEYS.codexActivity) {
+    codexActivity = loadCodexActivity();
+    refreshCodexActivityUi();
+    return;
+  }
+  if (event.key === KEYS.quickChatDraft) {
+    quickChatDraft = event.newValue ?? "";
+    if (currentWindowLabel === "utility-popup" && utilityPopupMode === "chat") {
+      const input = app.querySelector<HTMLInputElement>("#quick-chat-input");
+      if (input) input.value = quickChatDraft;
+    }
+    return;
+  }
+  if (event.key === KEYS.soundsEnabled) {
+    soundEnabled = event.newValue === "true";
+    setGhostySoundEnabled(soundEnabled);
+    return;
+  }
+  if (event.key === KEYS.soundVolume) {
+    soundVolume = readNumber(KEYS.soundVolume, 24, 0, 100);
+    setGhostySoundVolume(soundVolume / 100);
+    return;
+  }
+  if (event.key === KEYS.focusHistory) {
+    focusHistory = readFocusHistory();
+    paintFocusSummary();
+    return;
+  }
   if (event.key === KEYS.quickChatWebsiteCache) {
     quickChatWebsiteCache = readQuickChatWebsiteCache();
     return;
@@ -3245,8 +4414,8 @@ window.addEventListener("storage", (event) => {
   else if (event.key === KEYS.clipboard) clipboardEntries = readClipboardEntries();
   else if (event.key === KEYS.shortcuts) shortcuts = readShortcuts();
   else if (event.key === KEYS.petName) petName = localStorage.getItem(KEYS.petName) || "Ghosty";
-  else if (event.key === KEYS.petSkin) petSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight"], "pearl");
-  else if (event.key === KEYS.petAccessory) petAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow"], "none");
+  else if (event.key === KEYS.petSkin) petSkin = readChoice(KEYS.petSkin, ["pearl", "smoke", "midnight", "mint", "coral", "lavender"], "pearl");
+  else if (event.key === KEYS.petAccessory) petAccessory = readChoice(KEYS.petAccessory, ["none", "star", "bow", "halo", "leaf", "crown"], "none");
   else if (event.key === KEYS.focus) focusState = readFocusState();
   else return;
 

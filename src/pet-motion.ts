@@ -1,5 +1,5 @@
-type Skin = "pearl" | "smoke" | "midnight";
-type Accessory = "none" | "star" | "bow";
+type Skin = "pearl" | "smoke" | "midnight" | "mint" | "coral" | "lavender";
+type Accessory = "none" | "star" | "bow" | "halo" | "leaf" | "crown";
 export type PetState = "idle" | "working" | "thinking" | "searching" | "approval" | "question" | "error" | "finished" | "ratelimit" | "sleeping" | "dizzy";
 export type PetEmote = "love" | "surprised" | "proud" | "wink" | "yawn" | "happy" | "annoyed";
 type EyeShape = "pill" | "wide" | "dot" | "line" | "flat" | "happy" | "closed" | "spiral" | "heart" | "star" | "tired" | "wink" | "cup";
@@ -64,6 +64,9 @@ const PALETTES: Record<Skin, Palette> = {
   pearl: { top: "#85828a", middle: "#615e66", bottom: "#3a383f", edge: "#a6a2aa", glint: "#f0edf1" },
   smoke: { top: "#71808a", middle: "#4a5760", bottom: "#293138", edge: "#99a7ad", glint: "#e5f0f4" },
   midnight: { top: "#76738e", middle: "#4f4d63", bottom: "#302f40", edge: "#9692ac", glint: "#e9e5ff" },
+  mint: { top: "#73958b", middle: "#4e7168", bottom: "#304c46", edge: "#a8c9bd", glint: "#e9fff5" },
+  coral: { top: "#a77c79", middle: "#805955", bottom: "#533b3b", edge: "#d3aaa0", glint: "#fff0e7" },
+  lavender: { top: "#9484a8", middle: "#675b7b", bottom: "#403951", edge: "#c2b2d8", glint: "#f7edff" },
 };
 
 const CHANNELS: Channel[] = ["squashX", "squashY", "lift", "tilt", "roll", "offsetX", "hands", "eyeScale", "morph", "mouth", "badgeScale"];
@@ -892,8 +895,8 @@ export class PetMotionEngine {
   private syncAppearance() {
     const skin = this.root.dataset.skin;
     const accessory = this.root.dataset.accessory;
-    this.skin = skin === "smoke" || skin === "midnight" ? skin : "pearl";
-    this.accessory = accessory === "star" || accessory === "bow" ? accessory : "none";
+    this.skin = skin === "smoke" || skin === "midnight" || skin === "mint" || skin === "coral" || skin === "lavender" ? skin : "pearl";
+    this.accessory = accessory === "star" || accessory === "bow" || accessory === "halo" || accessory === "leaf" || accessory === "crown" ? accessory : "none";
     this.setAppearance(this.skin, this.accessory, this.root.dataset.mood ?? "calm");
   }
 
@@ -1946,7 +1949,7 @@ export class PetMotionEngine {
       ctx.lineWidth = 0.8;
       ctx.fill(star);
       ctx.stroke(star);
-    } else {
+    } else if (this.accessory === "bow") {
       ctx.fillStyle = "#a85d72";
       ctx.strokeStyle = "#e4a5b6";
       ctx.lineWidth = 0.9;
@@ -1960,6 +1963,49 @@ export class PetMotionEngine {
       ctx.arc(0, 0, 1.7, 0, Math.PI * 2);
       ctx.fillStyle = palette.glint;
       ctx.fill();
+    } else if (this.accessory === "halo") {
+      ctx.strokeStyle = "#d9d4bd";
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.ellipse(0, -5, 10, 3.7, -0.1, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = "#fff6d2";
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.ellipse(0, -5.5, 10, 3.7, -0.1, Math.PI * 1.05, Math.PI * 1.9);
+      ctx.stroke();
+    } else if (this.accessory === "leaf") {
+      ctx.fillStyle = "#789782";
+      ctx.strokeStyle = "#bed5b7";
+      ctx.lineWidth = 0.8;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        ctx.ellipse(side * 4, -1.2, 4.4, 2.6, side * 0.55, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "#e1edcf";
+      ctx.lineWidth = 0.7;
+      ctx.beginPath();
+      ctx.moveTo(-5, 1);
+      ctx.lineTo(0, -3);
+      ctx.lineTo(5, 1);
+      ctx.stroke();
+    } else if (this.accessory === "crown") {
+      const crown = new Path2D();
+      crown.moveTo(-8, 2);
+      crown.lineTo(-7, -5);
+      crown.lineTo(-2.5, -1);
+      crown.lineTo(0, -7);
+      crown.lineTo(2.5, -1);
+      crown.lineTo(7, -5);
+      crown.lineTo(8, 2);
+      crown.closePath();
+      ctx.fillStyle = "#b5a26c";
+      ctx.strokeStyle = "#eadcad";
+      ctx.lineWidth = 0.8;
+      ctx.fill(crown);
+      ctx.stroke(crown);
     }
     ctx.restore();
   }

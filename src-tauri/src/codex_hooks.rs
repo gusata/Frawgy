@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
@@ -29,6 +32,8 @@ pub struct CodexHookEvent {
     pub tool_name: Option<String>,
     pub agent_type: Option<String>,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
     pub approval_id: Option<String>,
     #[serde(default)]
     pub approval_description: Option<String>,
@@ -38,9 +43,35 @@ pub struct CodexHookEvent {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexHookSync {
+pub struct CodexHookReviewState {
     pub enabled: bool,
-    pub updated: bool,
+    pub needs_review: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexHookEventChange {
+    pub event_name: String,
+    pub before: Vec<Value>,
+    pub after: Vec<Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexHookPreview {
+    pub enabled: bool,
+    pub config_path: String,
+    pub fingerprint: String,
+    pub config_changed: bool,
+    pub backup_will_be_created: bool,
+    pub changes: Vec<CodexHookEventChange>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexHookChangeResult {
+    pub enabled: bool,
+    pub backup_path: Option<String>,
 }
 
 struct BridgePaths {
@@ -75,12 +106,8 @@ fn bridge_paths(app: &AppHandle) -> Result<BridgePaths, String> {
     })
 }
 
-fn load_config(path: &Path) -> Result<(Value, bool), String> {
-    if !path.exists() {
-        return Ok((json!({}), false));
-    }
-    let contents = fs::read(path).map_err(|error| format!("não consegui ler hooks.json do Codex: {error}"))?;
-    let config: Value = serde_json::from_slice(&contents)
+fn parse_config(contents: &[u8]) -> Result<Value, String> {
+    let config: Value = serde_json::from_slice(contents)
         .map_err(|error| format!("hooks.json do Codex não contém JSON válido: {error}"))?;
     let object = config
         .as_object()
@@ -88,7 +115,116 @@ fn load_config(path: &Path) -> Result<(Value, bool), String> {
     if object.get("hooks").is_some_and(|hooks| !hooks.is_object()) {
         return Err("a propriedade hooks do hooks.json do Codex precisa ser um objeto".to_string());
     }
-    Ok((config, true))
+    Ok(config)
+}
+
+fn load_config(path: &Path) -> Result<(Value, bool), String> {
+    match fs::read(path) {
+        Ok(contents) => Ok((parse_config(&contents)?, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((json!({}), false)),
+        Err(error) => Err(format!("não consegui ler hooks.json do Codex: {error}")),
+    }
+}
+
+fn fingerprint(contents: Option<&[u8]>) -> String {
+    let Some(contents) = contents else { return "missing".to_string() };
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in contents {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64-{hash:016x}")
+}
+
+fn read_config_snapshot(path: &Path) -> Result<(Vec<u8>, bool), String> {
+    match fs::read(path) {
+        Ok(contents) => Ok((contents, true)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+        Err(error) => Err(format!("não consegui ler hooks.json do Codex: {error}")),
+    }
+}
+
+fn ghosty_groups_for_event(config: &Value, event_name: &str) -> Vec<Value> {
+    config
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event_name))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| {
+            let handlers = group.get("hooks")?.as_array()?;
+            let ghosty_handlers = handlers
+                .iter()
+                .filter(|handler| is_ghosty_handler(handler))
+                .cloned()
+                .collect::<Vec<_>>();
+            if ghosty_handlers.is_empty() { return None; }
+            let mut visible_group = group.clone();
+            visible_group["hooks"] = json!(ghosty_handlers);
+            Some(visible_group)
+        })
+        .collect()
+}
+
+fn event_changes(before: &Value, after: &Value) -> Vec<CodexHookEventChange> {
+    let mut event_names = BTreeSet::new();
+    event_names.extend(HOOK_EVENTS.iter().map(|name| (*name).to_string()));
+    for config in [before, after] {
+        if let Some(hooks) = config.get("hooks").and_then(Value::as_object) {
+            event_names.extend(hooks.keys().cloned());
+        }
+    }
+    event_names
+        .into_iter()
+        .filter_map(|event_name| {
+            let old = ghosty_groups_for_event(before, &event_name);
+            let new = ghosty_groups_for_event(after, &event_name);
+            (old != new).then(|| CodexHookEventChange {
+                event_name,
+                before: old,
+                after: new,
+            })
+        })
+        .collect()
+}
+
+fn desired_config(
+    paths: &BridgePaths,
+    mut config: Value,
+    enabled: bool,
+) -> Result<Value, String> {
+    remove_ghosty_groups(&mut config)?;
+    if enabled {
+        let command = hook_command(&paths.script, &paths.events);
+        add_ghosty_groups(&mut config, &command)?;
+    }
+    Ok(config)
+}
+
+fn save_backup(path: &Path, contents: &[u8]) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "não encontrei a pasta de configuração do Codex".to_string())?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    for attempt in 0..20_u8 {
+        let suffix = if attempt == 0 { String::new() } else { format!("-{attempt}") };
+        let backup = parent.join(format!("hooks.json.edge-ghosty-{timestamp}{suffix}.bak"));
+        match OpenOptions::new().write(true).create_new(true).open(&backup) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(contents).and_then(|_| file.sync_all()) {
+                    let _ = fs::remove_file(&backup);
+                    return Err(format!("não consegui criar o backup do hooks.json: {error}"));
+                }
+                return Ok(backup);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("não consegui criar o backup do hooks.json: {error}")),
+        }
+    }
+    Err("não consegui reservar um nome único para o backup do hooks.json".to_string())
 }
 
 fn is_ghosty_handler(handler: &Value) -> bool {
@@ -253,35 +389,64 @@ pub fn codex_hooks_enabled(app: AppHandle) -> Result<bool, String> {
 }
 
 #[tauri::command]
-pub fn sync_codex_hooks_if_enabled(app: AppHandle) -> Result<CodexHookSync, String> {
+pub fn codex_hooks_review_state(app: AppHandle) -> Result<CodexHookReviewState, String> {
     let paths = bridge_paths(&app)?;
     if paths.disabled.exists() {
-        return Ok(CodexHookSync { enabled: false, updated: false });
+        return Ok(CodexHookReviewState { enabled: false, needs_review: false });
     }
     let (config, exists) = load_config(&paths.config)?;
     if !exists || !has_ghosty_group(&config) {
-        return Ok(CodexHookSync { enabled: false, updated: false });
+        return Ok(CodexHookReviewState { enabled: false, needs_review: false });
     }
 
     let script_is_current = fs::read_to_string(&paths.script)
         .ok()
         .is_some_and(|script| script == include_str!("codex-hook.ps1"));
-    if has_current_approval_hook(&config) && script_is_current && paths.responses.exists() {
-        return Ok(CodexHookSync { enabled: true, updated: false });
-    }
-
-    set_codex_hooks_enabled(app, true)?;
-    Ok(CodexHookSync { enabled: true, updated: true })
+    let needs_review = !(has_current_approval_hook(&config) && script_is_current && paths.responses.exists());
+    Ok(CodexHookReviewState { enabled: true, needs_review })
 }
 
 #[tauri::command]
-pub fn set_codex_hooks_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
+pub fn codex_hooks_preview(app: AppHandle, enabled: bool) -> Result<CodexHookPreview, String> {
     let paths = bridge_paths(&app)?;
-    let (mut config, exists) = load_config(&paths.config)?;
+    let (contents, exists) = read_config_snapshot(&paths.config)?;
+    let current = if exists { parse_config(&contents)? } else { json!({}) };
+    let desired = desired_config(&paths, current.clone(), enabled)?;
+    Ok(CodexHookPreview {
+        enabled,
+        config_path: paths.config.display().to_string(),
+        fingerprint: fingerprint(exists.then_some(contents.as_slice())),
+        config_changed: current != desired,
+        backup_will_be_created: exists && current != desired,
+        changes: event_changes(&current, &desired),
+    })
+}
+
+#[tauri::command]
+pub fn apply_codex_hooks_change(
+    app: AppHandle,
+    enabled: bool,
+    expected_fingerprint: String,
+) -> Result<CodexHookChangeResult, String> {
+    let paths = bridge_paths(&app)?;
+    let (contents, exists) = read_config_snapshot(&paths.config)?;
+    if fingerprint(exists.then_some(contents.as_slice())) != expected_fingerprint {
+        return Err("hooks.json mudou depois da revisão. Atualize a prévia e confira as diferenças novamente.".to_string());
+    }
+    let mut config = if exists { parse_config(&contents)? } else { json!({}) };
+    let desired = desired_config(&paths, config.clone(), enabled)?;
+    let config_changed = config != desired;
+    let mut backup_path = None;
 
     if !enabled {
-        if exists && remove_ghosty_groups(&mut config)? {
-            write_config(&paths.config, &config)?;
+        if exists && config_changed {
+            backup_path = Some(save_backup(&paths.config, &contents)?);
+            // Detect edits made while the reviewed backup was being written.
+            let (latest_contents, latest_exists) = read_config_snapshot(&paths.config)?;
+            if !latest_exists || latest_contents != contents {
+                return Err("hooks.json mudou durante a gravação do backup. Nenhuma alteração foi aplicada; revise novamente.".to_string());
+            }
+            write_config(&paths.config, &desired)?;
         }
         if paths.events.exists() {
             let _ = fs::remove_dir_all(&paths.events);
@@ -295,7 +460,10 @@ pub fn set_codex_hooks_enabled(app: AppHandle, enabled: bool) -> Result<bool, St
         fs::create_dir_all(&paths.directory).map_err(|error| format!("não consegui desativar o hook local do Codex: {error}"))?;
         fs::write(&paths.disabled, b"disabled\n")
             .map_err(|error| format!("não consegui desativar o hook local do Codex: {error}"))?;
-        return Ok(false);
+        return Ok(CodexHookChangeResult {
+            enabled: false,
+            backup_path: backup_path.map(|path| path.display().to_string()),
+        });
     }
 
     fs::create_dir_all(&paths.directory).map_err(|error| format!("não consegui preparar a integração com Codex: {error}"))?;
@@ -305,15 +473,24 @@ pub fn set_codex_hooks_enabled(app: AppHandle, enabled: bool) -> Result<bool, St
     fs::write(&paths.script, include_str!("codex-hook.ps1"))
         .map_err(|error| format!("não consegui instalar o hook local do Codex: {error}"))?;
 
-    remove_ghosty_groups(&mut config)?;
-    let command = hook_command(&paths.script, &paths.events);
-    add_ghosty_groups(&mut config, &command)?;
-    write_config(&paths.config, &config)?;
+    if config_changed {
+        if exists {
+            backup_path = Some(save_backup(&paths.config, &contents)?);
+            let (latest_contents, latest_exists) = read_config_snapshot(&paths.config)?;
+            if !latest_exists || latest_contents != contents {
+                return Err("hooks.json mudou durante a gravação do backup. Nenhuma alteração foi aplicada; revise novamente.".to_string());
+            }
+        }
+        write_config(&paths.config, &desired)?;
+    }
     if paths.disabled.exists() {
         fs::remove_file(&paths.disabled)
             .map_err(|error| format!("não consegui reativar o hook local do Codex: {error}"))?;
     }
-    Ok(true)
+    Ok(CodexHookChangeResult {
+        enabled: true,
+        backup_path: backup_path.map(|path| path.display().to_string()),
+    })
 }
 
 fn event_is_supported(event_name: &str) -> bool {

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
+use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,10 @@ use windows::core::PCWSTR;
 mod codex_hooks;
 mod codex_chat;
 mod quick_chat_hotkey;
+mod credentials;
+mod github;
+mod vercel;
+mod tray;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +87,12 @@ struct MediaInfo {
     title: String,
     artist: String,
     playing: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PocketFileMetadata {
+    size_bytes: u64,
 }
 
 #[derive(Default)]
@@ -287,6 +298,19 @@ fn open_targets(targets: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn pocket_file_metadata(path: String) -> Result<PocketFileMetadata, String> {
+    if path.encode_utf16().count() > 32_767 {
+        return Err("O caminho do arquivo excede o limite do Windows.".to_string());
+    }
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("NÃ£o consegui consultar o tamanho do arquivo: {error}"))?;
+    if !metadata.is_file() {
+        return Err("O item guardado nÃ£o Ã© um arquivo comum.".to_string());
+    }
+    Ok(PocketFileMetadata { size_bytes: metadata.len() })
+}
+
+#[tauri::command]
 fn run_shortcut(name: String) -> Result<(), String> {
     let target = match name.as_str() {
         "Terminal" => ("wt.exe", ""),
@@ -302,6 +326,53 @@ fn run_shortcut(name: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+const AUTOSTART_REGISTRY_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_REGISTRY_VALUE: &str = "Edge Ghosty";
+
+#[tauri::command]
+fn is_autostart_enabled() -> Result<bool, String> {
+    let output = Command::new("reg.exe")
+        .args(["query", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|error| format!("não consegui consultar a inicialização do Windows: {error}"))?;
+    Ok(output.status.success())
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
+    if !enabled {
+        if !is_autostart_enabled()? {
+            return Ok(());
+        }
+        let output = Command::new("reg.exe")
+            .args(["delete", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE, "/f"])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|error| format!("não consegui remover a inicialização do Windows: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if detail.is_empty() { "o Windows recusou a alteração".to_string() } else { detail });
+    }
+
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let command_line = format!("\"{}\"", executable.display());
+    let output = Command::new("reg.exe")
+        .args(["add", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE, "/t", "REG_SZ", "/d"])
+        .arg(command_line)
+        .args(["/f"])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|error| format!("não consegui configurar a inicialização do Windows: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if detail.is_empty() { "o Windows recusou a alteração".to_string() } else { detail })
 }
 
 fn display_id(monitor: &Monitor) -> String {
@@ -459,12 +530,12 @@ fn window_geometry(edge: Edge, monitor: &Monitor) -> (PhysicalSize<u32>, Physica
     let monitor_size = monitor.size();
     let logical_size = match edge {
         Edge::Left => (
-            400,
+            900.min((f64::from(monitor_size.width) / scale) as u32),
             720.min((f64::from(monitor_size.height) / scale) as u32),
         ),
         Edge::Top | Edge::Bottom => (
-            840.min((f64::from(monitor_size.width) / scale) as u32),
-            320.min((f64::from(monitor_size.height) / scale) as u32),
+            1100.min((f64::from(monitor_size.width) / scale) as u32),
+            420.min((f64::from(monitor_size.height) / scale) as u32),
         ),
     };
     let size = PhysicalSize::new(
@@ -645,7 +716,7 @@ fn ensure_display_windows(app: &AppHandle, count: usize) -> Result<(), String> {
         }
         WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
             .title("Edge Ghosty")
-            .inner_size(400.0, 720.0)
+            .inner_size(900.0, 720.0)
             .decorations(false)
             .transparent(true)
             .shadow(false)
@@ -764,7 +835,11 @@ pub fn run() {
     tauri::Builder::default()
         .manage(CursorState::default())
         .manage(codex_chat::CodexChatState::default())
+        .manage(github::GithubCache::default())
+        .manage(vercel::VercelCache::default())
+        .manage(tray::AppPauseState::default())
         .setup(|app| {
+            tray::install(app.handle()).map_err(std::io::Error::other)?;
             quick_chat_hotkey::start(app.handle().clone());
             let cursor_state = app.state::<CursorState>();
             spawn_cursor_poll(
@@ -789,7 +864,21 @@ pub fn run() {
             media_control,
             get_media_info,
             open_targets,
+            pocket_file_metadata,
             run_shortcut,
+            is_autostart_enabled,
+            set_autostart_enabled,
+            tray::is_updates_paused,
+            github::github_token_status,
+            github::github_save_token,
+            github::github_clear_token,
+            github::github_cached_snapshot,
+            github::github_refresh,
+            vercel::vercel_token_status,
+            vercel::vercel_save_token,
+            vercel::vercel_clear_token,
+            vercel::vercel_cached_snapshot,
+            vercel::vercel_refresh,
             list_displays,
             set_island_rect,
             apply_display_layout,
@@ -804,8 +893,9 @@ pub fn run() {
             codex_chat::quick_chat_respond,
             codex_chat::quick_chat_close,
             codex_hooks::codex_hooks_enabled,
-            codex_hooks::sync_codex_hooks_if_enabled,
-            codex_hooks::set_codex_hooks_enabled,
+            codex_hooks::codex_hooks_review_state,
+            codex_hooks::codex_hooks_preview,
+            codex_hooks::apply_codex_hooks_change,
             codex_hooks::drain_codex_events,
             codex_hooks::resolve_codex_approval
         ])
