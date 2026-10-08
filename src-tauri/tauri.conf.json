@@ -39,6 +39,23 @@
         "dragDropEnabled": true,
         "visible": false,
         "focus": false
+      },
+      {
+        "label": "settings-window",
+        "title": "Configurações — Edge Ghosty",
+        "width": 1040,
+        "height": 760,
+        "minWidth": 780,
+        "minHeight": 560,
+        "decorations": true,
+        "transparent": false,
+        "shadow": true,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "resizable": true,
+        "dragDropEnabled": false,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": {

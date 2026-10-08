@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "updater-main",
   "description": "Permite à janela principal verificar e instalar atualizações assinadas do Edge Ghosty.",
-  "windows": ["main"],
+  "windows": ["main", "settings-window"],
   "permissions": ["updater:default", "process:allow-restart"]
 }
