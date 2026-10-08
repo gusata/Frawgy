@@ -1303,6 +1303,7 @@ function persistSettings() {
 function applyIslandVariables(island: HTMLElement) {
   island.dataset.edge = edge;
   island.style.setProperty("--bar-length", `${barLength}px`);
+  island.style.setProperty("--bar-half-length", `${barLength / 2}px`);
   island.style.setProperty("--bar-thickness", `${barThickness}px`);
   const expandedSize = expandedIslandSize();
   island.style.setProperty("--expanded-width", `${expandedSize.width}px`);
@@ -3510,6 +3511,15 @@ function paintMediaInfo() {
   if (positionLabel) positionLabel.textContent = formatMediaTime(mediaSeekDragging && progress ? Number(progress.value) : currentMediaPosition());
   const durationLabel = app.querySelector<HTMLElement>(".media-duration");
   if (durationLabel) durationLabel.textContent = formatMediaTime(duration);
+
+  const mediaPeek = app.querySelector<HTMLElement>(".media-peek");
+  const mediaPeekImage = mediaPeek?.querySelector<HTMLImageElement>("img");
+  if (mediaPeekImage && (mediaPeekImage.getAttribute("src") ?? "") !== mediaInfo.artworkDataUrl) {
+    if (mediaInfo.artworkDataUrl) mediaPeekImage.setAttribute("src", mediaInfo.artworkDataUrl);
+    else mediaPeekImage.removeAttribute("src");
+  }
+  const hasPlayingArtwork = mediaInfo.playing && Boolean(mediaInfo.artworkDataUrl);
+  app.querySelector<HTMLElement>(".edge-island")?.classList.toggle("is-media-playing", hasPlayingArtwork);
 }
 
 function bindAudioMixerInputs(root: ParentNode) {
@@ -4288,7 +4298,7 @@ function render() {
     }
     : null;
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
         <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
         <div class="island-content">
@@ -4320,6 +4330,7 @@ function render() {
           </div>
         </div>
       </div>
+      <div class="media-peek" aria-hidden="true"><img alt="" draggable="false"${mediaInfo.artworkDataUrl ? ` src="${escapeHtml(mediaInfo.artworkDataUrl)}"` : ""}></div>
       <div class="ghosty-completion" aria-hidden="true">
         <div class="pet ghosty-completion-pet" data-skin="${petSkin}" data-accessory="${petAccessory}" data-mood="happy" aria-hidden="true">
           <canvas class="pet-canvas" aria-hidden="true"></canvas>
@@ -4453,13 +4464,13 @@ async function startMainWindow() {
   let nextMixerRefreshAt = 0;
   window.setInterval(() => {
     const mediaViewOpen = expanded && activeTab === "home" && activeHomeView === "media";
-    if (!mediaViewOpen) return;
-    paintMediaInfo();
     const now = Date.now();
     if (now >= nextMediaRefreshAt) {
-      nextMediaRefreshAt = now + 1500;
+      nextMediaRefreshAt = now + (mediaViewOpen ? 1500 : 4000);
       void refreshMediaInfo();
     }
+    if (!mediaViewOpen) return;
+    paintMediaInfo();
     if (volumeMixerOpen && now >= nextMixerRefreshAt) {
       nextMixerRefreshAt = now + 2200;
       void refreshAudioMixer();
@@ -4804,5 +4815,12 @@ else {
   render();
   bindNativeFileDrop();
   void refreshMediaInfo();
+  let nextMediaRefreshAt = 0;
+  window.setInterval(() => {
+    const now = Date.now();
+    if (now < nextMediaRefreshAt) return;
+    nextMediaRefreshAt = now + 4000;
+    void refreshMediaInfo();
+  }, 1000);
   void invoke<number>("get_system_volume").then((value) => { volume = value; }).catch(() => undefined);
 }
