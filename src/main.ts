@@ -2673,7 +2673,7 @@ function renderOnboarding() {
         <div class="onboarding-step-label">CONFIGURAÇÃO RÁPIDA <span>1 DE 2</span></div>
         <div class="onboarding-welcome-row">
           ${renderPetCharacter("onboarding-pet")}
-          <div><h1>Vamos preparar seu Ghosty</h1><p>Em menos de um minuto, escolha como ele aparece no seu dia a dia.</p></div>
+          <div><h1>Vamos preparar seu Ghosty</h1><p>Passe o cursor pela barrinha na borda para abrir o Ghosty. Use os ícones do topo para alternar entre Home, Pet e Atalhos; a tela continua clicável quando a ilha está recolhida.</p></div>
         </div>
         <div class="onboarding-benefits">
           <div><span>HOME</span><p>Controle mídia e volume sem sair do que está fazendo.</p></div>

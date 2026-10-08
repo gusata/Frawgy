@@ -255,3 +255,5 @@ npm run tauri dev
 - Antes de alterar a arquitetura, verificar este arquivo e o snapshot mais recente em `docs/context/`.
 - Ao finalizar uma tarefa, criar um novo snapshot em `docs/context/`.
 - Se a compilação Rust falhar, solicitar a mensagem completa do Developer PowerShell e corrigir o código com base nela.
+
+73. Em `2026-10-08-edge-ghosty-instalador-windows-github`, o bundle Windows usa NSIS para gerar `-setup.exe`, instala por usuário sem exigir administrador, inclui o runtime do Visual C++ e executa o bootstrapper embutido do WebView2 quando necessário. O desinstalador padrão do Windows fica disponível e preserva os dados locais do usuário. A primeira execução limpa abre um guia que explica a barrinha e a navegação, além de permitir configurar atalhos e inicialização. O chat continua dependendo do Codex CLI instalado separadamente. A tag `vX.Y.Z` aciona GitHub Actions e cria um rascunho de Release; o ícone transparente placeholder foi substituído pelo símbolo vetorial do Ghosty convertido em ICO.

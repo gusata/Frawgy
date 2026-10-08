@@ -23,6 +23,29 @@ Os hooks locais não registram prompts, respostas, comandos ou resultados de fer
 
 Detalhes sobre dados locais, tokens e chamadas de serviço: [Privacidade e dados locais](docs/PRIVACIDADE.md).
 
+## Instalar no Windows
+
+Baixe o instalador `Edge Ghosty_*_x64-setup.exe` na página de Releases e execute-o. A instalação é feita para sua conta e não exige privilégios de administrador. O instalador inclui o runtime do Visual C++ e verifica o WebView2; se o WebView2 estiver ausente, ele será instalado pela Microsoft, o que exige conexão com a internet.
+
+Para remover o app, use **Configurações do Windows → Aplicativos → Aplicativos instalados → Edge Ghosty → Desinstalar**. A desinstalação remove o programa e preserva as preferências e os dados locais da sua conta do Windows.
+
+Na primeira abertura, o Ghosty mostra um guia rápido para escolher a inicialização com o Windows e os atalhos da Home. Essa escolha pode ser alterada depois nas Configurações.
+
+O chat rápido é opcional e requer o Codex CLI instalado separadamente. Sem ele, o restante do Edge Ghosty continua funcionando; ao abrir o chat, o app informa se não encontrar o CLI.
+
+## Gerar e publicar o instalador
+
+Em um Windows x64 com Node.js 20+, Rust para MSVC e as ferramentas C++ do Visual Studio Build Tools:
+
+```powershell
+npm ci
+npm run build:windows
+```
+
+O instalador `.exe` será criado em `src-tauri/target/release/bundle/nsis/`. Para uma versão do GitHub, sincronize a versão em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`, envie a tag correspondente `vX.Y.Z` e aguarde a Actions `Windows release`: ela compila o instalador e cria um rascunho de Release com o `.exe` anexado. Revise o rascunho e publique-o pela página de Releases.
+
+Os instaladores ainda não são assinados digitalmente; o Windows pode exibir um aviso do SmartScreen ao baixar ou executar uma versão nova.
+
 ## Desenvolvimento
 
 Requisitos: Node 20+, Rust e WebView2.
