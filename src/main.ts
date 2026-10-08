@@ -16,6 +16,7 @@ type FocusHistoryEntry = { id: string; startedAt: number; endedAt: number; durat
 type MediaInfo = { title: string; artist: string; playing: boolean };
 type Edge = "left" | "top" | "bottom";
 type MenuTab = "home" | "pet" | "shortcuts";
+type HomeView = "now" | "activity" | "github" | "vercel" | "media";
 type UtilityPopupMode = "focus" | "focus-summary" | "codex-activity" | "pocket" | "customize" | "clipboard" | "chat";
 type UtilityPopupPosition = { x: number; y: number };
 type QuickChatMessage = { id: string; role: "user" | "assistant"; text: string; pending?: boolean };
@@ -269,6 +270,7 @@ let volume = 62;
 let expanded = onboardingOpen;
 let settingsOpen = false;
 let activeTab: MenuTab = "home";
+let activeHomeView: HomeView = "now";
 let utilityPopupMode: UtilityPopupMode | null = null;
 let utilityPopupBlurTimer: number | undefined;
 let utilityPopupPositionSaveTimer: number | undefined;
@@ -494,7 +496,11 @@ function renderCodexRecentActivity(limit = 2) {
   return `<div class="codex-recent-activity" aria-live="polite"><small>ATIVIDADE RECENTE · SÓ NESTA SESSÃO</small>${visible.length
     ? visible.map((event) => {
       const time = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", minute: "2-digit" }).format(event.occurredAt);
-      return `<div class="codex-recent-event"><span>${escapeHtml(codexRecentActivityLabel(event))}</span><time>${time}</time></div>`;
+      const state = event.eventName === "PermissionRequest" ? "approval"
+        : event.eventName === "Interrupt" ? "error"
+          : ["Stop", "PostToolUse", "SubagentStop"].includes(event.eventName) ? "success"
+            : ["UserPromptSubmit", "PreToolUse", "SubagentStart"].includes(event.eventName) ? "active" : "neutral";
+      return `<div class="codex-recent-event" data-state="${state}"><i aria-hidden="true"></i><span>${escapeHtml(codexRecentActivityLabel(event))}</span><time>${time}</time></div>`;
     }).join("")
     : '<span class="codex-recent-empty">As etapas aparecem aqui enquanto o Ghosty estiver conectado.</span>'}</div>`;
 }
@@ -531,16 +537,6 @@ function recordCodexActivity(events: CodexHookEvent[]) {
   for (const date of Object.keys(codexActivity)) if (new Date(`${date}T12:00:00`).getTime() < cutoff.getTime()) delete codexActivity[date];
   localStorage.setItem(KEYS.codexActivity, JSON.stringify(codexActivity));
   refreshCodexActivityUi();
-}
-
-function renderCodexActivityCard() {
-  const totals = codexActivityTotals();
-  const focusedMinutes = Math.round(totals.activeMs / 60_000);
-  return `
-    <button class="home-overview-link codex-activity-summary" data-action="open-utility-popup" data-popup="codex-activity">
-      <span class="overview-link-copy"><small>ATIVIDADE DO CODEX · 7 DIAS</small><strong>${totals.completed} tarefas concluídas</strong><span>${focusedMinutes} min ativos · ${totals.approvals} aprovações</span></span>
-      <span class="overview-link-arrow">↗</span>
-    </button>`;
 }
 
 function renderCodexActivityPopup() {
@@ -587,16 +583,6 @@ function renderGithubContent() {
     <div class="github-overview-footer"><small>${authored.length} seus · ${reviews.length} para revisar</small><button data-action="github-refresh" aria-label="Atualizar GitHub" title="Atualizar" ${updatesPaused || githubLoading ? "disabled" : ""}>↻</button></div>`;
 }
 
-function renderGithubCard() {
-  const githubActive = activeHomeIntegration === "github";
-  const connected = githubActive ? githubConnected : vercelConnected;
-  const loading = githubActive ? githubLoading : vercelLoading;
-  return `<section class="home-overview-section github-card integration-dashboard">
-    <header class="overview-section-heading integration-heading"><span><small>INTEGRAÇÕES</small><span class="integration-tabs" role="tablist" aria-label="Serviço exibido"><button class="integration-tab ${githubActive ? "is-active" : ""}" data-action="integration-tab" data-integration="github" role="tab" aria-selected="${githubActive}">GitHub</button><button class="integration-tab ${!githubActive ? "is-active" : ""}" data-action="integration-tab" data-integration="vercel" role="tab" aria-selected="${!githubActive}">Vercel</button></span></span><button data-action="integration-refresh" aria-label="Atualizar ${githubActive ? "GitHub" : "Vercel"}" title="Atualizar" ${loading || updatesPaused || !connected ? "disabled" : ""}>↻</button></header>
-    <div class="integration-card-content">${githubActive ? renderGithubContent() : renderVercelContent()}</div>
-  </section>`;
-}
-
 function renderVercelContent() {
   if (vercelStatusLoading) return '<div class="github-empty">Verificando conexão com a Vercel…</div>';
   if (!vercelConnected) return `<div class="github-empty"><span>Veja o estado e as implantações recentes dos seus projetos.</span><button data-action="vercel-open-settings">Conectar Vercel</button></div>`;
@@ -608,7 +594,7 @@ function renderVercelContent() {
     const url = safeQuickChatWebsiteUrl(deployment.url);
     if (!url) return "";
     const state = deployment.state.toLocaleUpperCase("en-US");
-    const stateClass = state === "READY" ? "is-passed" : ["ERROR", "CANCELED"].includes(state) ? "is-failed" : "";
+    const stateClass = state === "READY" ? "is-passed" : state === "ERROR" ? "is-failed" : state === "CANCELED" ? "is-neutral" : "";
     const stateLabel = state === "READY" ? "Pronto" : state === "ERROR" ? "Falhou" : state === "BUILDING" || state === "INITIALIZING" ? "Em andamento" : state === "CANCELED" ? "Cancelado" : state;
     const detail = [deployment.target === "production" ? "produção" : deployment.target, deployment.branch].filter(Boolean).join(" · ");
     return `<button class="github-pull vercel-deployment" data-action="open-vercel-link" data-url="${escapeHtml(url)}"><span class="github-pull-main"><strong>${escapeHtml(deployment.name)}</strong><small>${escapeHtml(detail || deployment.commitMessage || "Implantação recente")}</small></span><small class="github-ci ${stateClass}">${escapeHtml(stateLabel)}</small><span class="overview-link-arrow">↗</span></button>`;
@@ -617,6 +603,28 @@ function renderVercelContent() {
   return `<div class="github-overview-meta"><span>${escapeHtml(vercelSnapshot.username)}${vercelTeamId ? " · equipe" : " · pessoal"}</span><span>${updatesPaused ? "Atualizações pausadas" : vercelLoading ? "Atualizando…" : `Atualizado às ${checked}`}</span></div>
     ${rows ? `<div class="github-pull-list">${rows}</div>` : '<div class="github-empty">Nenhuma implantação recente nesta conta.</div>'}
     ${error}<div class="github-overview-footer"><small>${vercelSnapshot.deployments.length} implantações recentes</small><button data-action="integration-refresh" aria-label="Atualizar Vercel" title="Atualizar" ${updatesPaused || vercelLoading ? "disabled" : ""}>↻</button></div>`;
+}
+
+function homeIntegrationHealth() {
+  const githubActive = activeHomeIntegration === "github";
+  const statusLoading = githubActive ? githubStatusLoading : vercelStatusLoading;
+  const loading = githubActive ? githubLoading : vercelLoading;
+  const connected = githubActive ? githubConnected : vercelConnected;
+  const error = githubActive ? githubError : vercelError;
+  if (statusLoading || loading) return { state: "active", label: "Atualizando" };
+  if (updatesPaused && connected) return { state: "paused", label: "Pausado" };
+  if (error) return { state: "error", label: "Atenção" };
+  if (!connected) return { state: "idle", label: "Desconectado" };
+  return { state: "success", label: "Conectado" };
+}
+
+function paintHomeIntegrationHealth() {
+  const indicator = app.querySelector<HTMLElement>(".integration-health");
+  if (!indicator) return;
+  const health = homeIntegrationHealth();
+  indicator.dataset.state = health.state;
+  const label = indicator.querySelector<HTMLElement>("span");
+  if (label) label.textContent = health.label;
 }
 
 function renderHomeIntegrationContent() {
@@ -643,6 +651,7 @@ function refreshGithubCard() {
     button.setAttribute("aria-label", `Atualizar ${service}`);
     button.title = `Atualizar ${service}`;
   });
+  paintHomeIntegrationHealth();
 }
 
 function bindGithubActions(container: ParentNode) {
@@ -859,13 +868,12 @@ async function clearVercelToken() {
 }
 
 function refreshCodexActivityUi() {
-  const recent = app.querySelector<HTMLElement>(".activity-overview-section .codex-recent-activity");
+  const recent = app.querySelector<HTMLElement>(".coucou-codex-card .codex-recent-activity");
   if (recent) recent.outerHTML = renderCodexRecentActivity(2);
-  const summary = app.querySelector<HTMLElement>(".codex-activity-summary");
-  if (summary) {
-    summary.outerHTML = renderCodexActivityCard();
-    app.querySelector<HTMLElement>(".codex-activity-summary")?.addEventListener("click", () => void openUtilityPopup("codex-activity"));
-  }
+  const state = app.querySelector<HTMLElement>(".coucou-codex-card .coucou-card-status span");
+  if (state) state.textContent = pendingCodexApprovals.length > 0 ? "Aprovação pendente" : codexTaskRunning ? "Trabalhando agora" : "Aguardando tarefa";
+  const count = app.querySelector<HTMLElement>(".coucou-codex-card .coucou-card-actions button");
+  if (count) count.innerHTML = `${codexActivityTotals().completed} tarefas concluídas <span>↗</span>`;
   if (utilityPopupMode === "codex-activity" && currentWindowLabel === "utility-popup") {
     const body = app.querySelector<HTMLElement>(".utility-popup-body");
     if (body) {
@@ -1070,6 +1078,11 @@ function updatePetAtmosphere() {
   app.querySelectorAll<HTMLElement>(".pet-mood-label, .home-pet-copy small").forEach((label) => {
     label.textContent = petMoodLabel(mood);
   });
+  app.querySelectorAll<HTMLElement>(".pet-side-status").forEach((status) => {
+    status.dataset.mood = mood;
+    const label = status.querySelector<HTMLElement>("span");
+    if (label) label.textContent = petMoodLabel(mood);
+  });
 }
 
 function radiusString(radius: number) {
@@ -1172,6 +1185,19 @@ function freezeIslandGeometry(island: HTMLElement) {
   setBodyGeometry(body, geometryMotion.width.value, geometryMotion.height.value, geometryMotion.radius.value);
 }
 
+function expandedIslandSize() {
+  const horizontal = edge !== "left";
+  const preferredHeight = settingsOpen || onboardingOpen
+    ? horizontal ? 380 : 620
+    : activeTab === "home" ? horizontal ? 210 : 480
+      : activeTab === "pet" ? horizontal ? 330 : 620
+        : horizontal ? 380 : 620;
+  return {
+    width: Math.min(horizontal ? 800 : 420, Math.max(220, window.innerWidth - (horizontal ? 40 : 32))),
+    height: Math.min(preferredHeight, Math.max(180, window.innerHeight - (horizontal ? 32 : 48))),
+  };
+}
+
 function animateIsland(open: boolean) {
   const body = app.querySelector<HTMLElement>(".island-body");
   if (!body) return;
@@ -1185,17 +1211,12 @@ function animateIsland(open: boolean) {
     height: new Tracked(rect.height),
     radius: new Tracked(currentRadius(style)),
   };
-  const target = edge === "left"
-    ? {
-      width: open ? Math.min(860, Math.max(220, window.innerWidth - 32)) : barThickness,
-      height: open ? Math.min(650, Math.max(220, window.innerHeight - 48)) : barLength,
-      radius: open ? 22 : 4,
-    }
-    : {
-      width: open ? Math.min(1060, Math.max(220, window.innerWidth - 40)) : barLength,
-      height: open ? Math.min(380, Math.max(220, window.innerHeight - 32)) : barThickness,
-      radius: open ? 22 : 4,
-    };
+  const expandedSize = expandedIslandSize();
+  const target = {
+    width: open ? expandedSize.width : edge === "left" ? barThickness : barLength,
+    height: open ? expandedSize.height : edge === "left" ? barLength : barThickness,
+    radius: open ? 22 : 4,
+  };
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const token = ++geometryFrame;
   geometryMotion = motion;
@@ -1261,6 +1282,9 @@ function applyIslandVariables(island: HTMLElement) {
   island.dataset.edge = edge;
   island.style.setProperty("--bar-length", `${barLength}px`);
   island.style.setProperty("--bar-thickness", `${barThickness}px`);
+  const expandedSize = expandedIslandSize();
+  island.style.setProperty("--expanded-width", `${expandedSize.width}px`);
+  island.style.setProperty("--expanded-height", `${expandedSize.height}px`);
   const body = island.querySelector<HTMLElement>(".island-body");
   const bodyRect = body?.getBoundingClientRect();
   const earSpan = edge === "left" ? bodyRect?.height : bodyRect?.width;
@@ -1359,56 +1383,132 @@ function formatDuration(ms: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function renderHomeShortcutItems(limit = 3) {
-  return shortcuts.slice(0, limit).map((shortcut) => `
-    <button class="home-shortcut" data-action="run-shortcut" data-shortcut-id="${escapeHtml(shortcut.id)}" title="${escapeHtml(shortcut.name)}">
-      <span class="home-shortcut-icon">${escapeHtml(shortcut.glyph)}</span><span class="home-shortcut-name">${escapeHtml(shortcut.name)}</span>
-    </button>`).join("");
+function homeViewLabel(view: HomeView = activeHomeView) {
+  return view === "activity" ? "Codex" : view === "github" ? "GitHub" : view === "vercel" ? "Vercel" : view === "media" ? "Mídia" : "Agora";
 }
 
 function renderHomePage() {
+  const status = homeStatusPresentation();
+  const views: Array<{ id: HomeView; label: string; accent: string; glyph: string }> = [
+    { id: "now", label: "Agora", accent: "#b5bac3", glyph: "●" },
+    { id: "activity", label: "Codex", accent: "#8bc7e7", glyph: "✦" },
+    { id: "github", label: "GitHub", accent: "#f4505e", glyph: "⌘" },
+    { id: "vercel", label: "Vercel", accent: "#7c5cff", glyph: "▲" },
+    { id: "media", label: "Mídia", accent: "#22d3ee", glyph: "♫" },
+  ];
+  const content = activeHomeView === "activity" ? renderHomeActivity()
+    : activeHomeView === "github" || activeHomeView === "vercel" ? renderHomeIntegrations()
+      : activeHomeView === "media" ? renderHomeMedia()
+        : renderHomeNow(status);
   return `
-    <div class="home-grid">
-      <section class="home-context-card">
-        <div class="home-message">
-          ${renderPetCharacter("pet-home")}
-          <div class="home-message-copy">
-            <span class="section-kicker">EDGE GHOSTY</span>
-            <strong>Tudo tranquilo por aqui.</strong>
-            <small>Música, volume e atalhos sempre à mão.</small>
-          </div>
-        </div>
-        <section class="quick-audio">
-          <span class="section-kicker home-audio-label">TOCANDO AGORA</span>
-          <div class="audio-now">
-            <div class="media-copy"><strong class="media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong><small class="media-artist">${escapeHtml(mediaInfo.artist || "Quando algo tocar, aparece aqui")}</small></div>
-            <div class="media-controls">
-              <button data-action="media-previous" aria-label="Faixa anterior" title="Anterior">${menuIcon("previous")}</button>
-              <button class="media-play" data-action="media-toggle" aria-label="Reproduzir ou pausar" title="Reproduzir ou pausar"><span class="media-play-icon">${menuIcon(mediaInfo.playing ? "pause" : "play")}</span></button>
-              <button data-action="media-next" aria-label="Próxima faixa" title="Próxima">${menuIcon("next")}</button>
-            </div>
-          </div>
-          <label class="volume-control"><span class="volume-icon">${menuIcon("volume")}</span><span class="volume-label">Volume</span><input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume do sistema" /><output id="volume-value">${volume}%</output></label>
-        </section>
-        <section class="home-shortcuts">
-          <span class="section-kicker">ATALHOS</span>
-          <div class="home-shortcut-items">${renderHomeShortcutItems(3)}</div>
-        </section>
+    <div class="coucou-home" data-home-panel="${activeHomeView}">
+      <section class="coucou-focus-card" data-home-status="${status.state}" aria-label="${homeViewLabel()}">
+        <div class="coucou-focus-pet">${renderPetCharacter("pet-home")}</div>
+        <div class="coucou-focus-content">${content}</div>
       </section>
-      <aside class="home-overview-card">
-        ${renderGithubCard()}
-        <section class="home-overview-section activity-overview-section">
-          <header class="overview-section-heading"><span><small>SESSÕES LOCAIS</small><strong>Codex</strong></span><span class="codex-live-indicator ${codexTaskRunning ? "is-active" : ""}"></span></header>
-          ${renderCodexRecentActivity(2)}
-          ${renderCodexActivityCard()}
-        </section>
-        <section class="home-overview-utilities" aria-label="Utilitários">
-          <button data-action="open-utility-popup" data-popup="focus">◷<span>Foco</span></button>
-          <button data-action="open-utility-popup" data-popup="pocket">▣<span>Bolso ${pocketItems.length ? `· ${pocketItems.length}` : ""}</span></button>
-          <button data-action="open-utility-popup" data-popup="clipboard">¶<span>Prancheta</span></button>
-        </section>
-      </aside>
+      <nav class="coucou-pill-card" aria-label="Mudar cartão em destaque">
+        ${views.filter(({ id }) => id !== activeHomeView).map(({ id, label, accent, glyph }) => `<button class="coucou-pill" type="button" style="--pill-accent:${accent}" data-action="home-view" data-home-view="${id}" aria-label="Mostrar ${label}"><span class="coucou-pill-glyph" aria-hidden="true">${glyph}</span><span>${label}</span></button>`).join("")}
+      </nav>
     </div>`;
+}
+
+function renderHomeNow(status: ReturnType<typeof homeStatusPresentation>) {
+  return `<div class="coucou-card-copy home-spotlight-card" data-home-status="${status.state}">
+    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>Ghosty</strong><span>Agora</span></div>
+    <div class="coucou-card-status" data-home-status-label><i aria-hidden="true"></i><span>${status.label}</span></div>
+    <strong class="coucou-card-title" data-home-status-title>${status.title}</strong>
+    <small class="coucou-card-description" data-home-status-copy>${status.description}</small>
+    <div class="coucou-card-actions">
+      <button data-action="open-utility-popup" data-popup="focus">Foco</button>
+      <button data-action="open-utility-popup" data-popup="pocket">Bolso</button>
+      <button data-action="open-utility-popup" data-popup="clipboard">Prancheta</button>
+    </div>
+  </div>`;
+}
+
+function renderHomeIntegrations() {
+  const githubActive = activeHomeView === "github";
+  const connected = githubActive ? githubConnected : vercelConnected;
+  const loading = githubActive ? githubLoading : vercelLoading;
+  const health = homeIntegrationHealth();
+  const service = githubActive ? "GitHub" : "Vercel";
+  return `<div class="coucou-card-copy coucou-integration-card">
+    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>${service}</strong><span>Integração</span><button class="coucou-card-refresh" data-action="integration-refresh" aria-label="Atualizar ${service}" title="Atualizar" ${loading || updatesPaused || !connected ? "disabled" : ""}>↻</button></div>
+    <div class="integration-health coucou-card-status" data-state="${health.state}" aria-live="polite"><i aria-hidden="true"></i><span>${health.label}</span></div>
+    <div class="integration-card-content">${githubActive ? renderGithubContent() : renderVercelContent()}</div>
+  </div>`;
+}
+
+function renderHomeActivity() {
+  const totals = codexActivityTotals();
+  return `<div class="coucou-card-copy coucou-codex-card">
+    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>Codex</strong><span>Sessão local</span></div>
+    <div class="coucou-card-status"><i aria-hidden="true"></i><span>${pendingCodexApprovals.length > 0 ? "Aprovação pendente" : codexTaskRunning ? "Trabalhando agora" : "Aguardando tarefa"}</span></div>
+    <div class="coucou-card-ticker">${renderCodexRecentActivity(2)}</div>
+    <div class="coucou-card-actions"><button data-action="open-utility-popup" data-popup="codex-activity">${totals.completed} tarefas concluídas <span>↗</span></button></div>
+  </div>`;
+}
+
+function renderHomeMedia() {
+  return `<div class="coucou-card-copy home-media-view">
+    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>Mídia</strong><span>Windows</span></div>
+    <strong class="coucou-card-title media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong>
+    <small class="coucou-card-description media-artist">${escapeHtml(mediaInfo.artist || "Quando algo tocar, aparece aqui")}</small>
+    <div class="coucou-media-bottom"><div class="media-controls">
+        <button data-action="media-previous" aria-label="Faixa anterior" title="Anterior">${menuIcon("previous")}</button>
+        <button class="media-play" data-action="media-toggle" aria-label="Reproduzir ou pausar" title="Reproduzir ou pausar"><span class="media-play-icon">${menuIcon(mediaInfo.playing ? "pause" : "play")}</span></button>
+        <button data-action="media-next" aria-label="Próxima faixa" title="Próxima">${menuIcon("next")}</button>
+      </div><label class="volume-control"><span class="volume-icon">${menuIcon("volume")}</span><input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume do sistema" /><output id="volume-value">${volume}%</output></label></div>
+  </div>`;
+}
+
+function homeStatusPresentation() {
+  if (pendingCodexApprovals.length > 0) {
+    return {
+      state: "approval",
+      label: "AÇÃO NECESSÁRIA",
+      title: "Aprovação pendente",
+      description: "Revise o pedido do Codex para continuar.",
+    };
+  }
+  if (codexTaskRunning) {
+    return {
+      state: "active",
+      label: "CODEX EM ATIVIDADE",
+      title: "O Codex está trabalhando",
+      description: "A tarefa segue em andamento no seu computador.",
+    };
+  }
+  if (updatesPaused) {
+    return {
+      state: "paused",
+      label: "INTEGRAÇÕES PAUSADAS",
+      title: "Tudo tranquilo por aqui.",
+      description: "GitHub e Vercel estão pausados; mídia e atalhos seguem prontos.",
+    };
+  }
+  return {
+    state: "ready",
+    label: "TUDO PRONTO",
+    title: "Tudo tranquilo por aqui.",
+    description: "Música, volume e atalhos sempre à mão.",
+  };
+}
+
+function refreshHomeStatusUi() {
+  const card = app.querySelector<HTMLElement>(".home-spotlight-card");
+  if (!card) return;
+  const status = homeStatusPresentation();
+  card.dataset.homeStatus = status.state;
+  if (card.parentElement?.parentElement?.classList.contains("coucou-focus-card")) {
+    card.parentElement.parentElement.dataset.homeStatus = status.state;
+  }
+  const label = card.querySelector<HTMLElement>("[data-home-status-label] span");
+  const title = card.querySelector<HTMLElement>("[data-home-status-title]");
+  const description = card.querySelector<HTMLElement>("[data-home-status-copy]");
+  if (label) label.textContent = status.label;
+  if (title) title.textContent = status.title;
+  if (description) description.textContent = status.description;
 }
 
 function renderPetPage() {
@@ -1429,7 +1529,7 @@ function renderPetPage() {
         <span class="section-kicker">SEU COMPANHEIRO</span>
         <strong>${escapeHtml(petName)}</strong>
         <p>Um cantinho para o que você está fazendo agora.</p>
-        <div class="pet-side-status"><i></i><span>${escapeHtml(petMoodLabel())}</span></div>
+        <div class="pet-side-status" data-mood="${mood}"><i></i><span>${escapeHtml(petMoodLabel(mood))}</span></div>
         <div class="pet-side-pocket"><small>BOLSO DO GHOSTY</small><strong>${pocketItems.length}/8 itens guardados</strong><span>${held ? escapeHtml(held.name) : "Solte algo no Ghosty para guardar."}</span></div>
         <div class="pet-side-actions">
           <button data-action="open-utility-popup" data-popup="pocket">Abrir Bolso</button>
@@ -2700,6 +2800,7 @@ function setCodexTaskRunning(running: boolean) {
     "aria-label",
     running ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty",
   );
+  refreshHomeStatusUi();
 }
 
 function setCodexApprovalButtons(container: ParentNode, approval: CodexApproval | null) {
@@ -2784,6 +2885,7 @@ function updateCodexApprovalPresentation() {
   });
   setCodexApprovalButtons(island, approval);
   refreshApprovalHitBounds();
+  refreshHomeStatusUi();
 }
 
 function clearTaskCompletionToast(island = app.querySelector<HTMLElement>(".edge-island")) {
@@ -3477,6 +3579,11 @@ async function bindNativeFileDrop() {
 
 function bindTabContent(tabView: HTMLElement) {
   bindPetInteractions(tabView);
+  tabView.querySelectorAll<HTMLButtonElement>("[data-action=home-view]").forEach((button) => button.addEventListener("click", () => {
+    const view = button.dataset.homeView;
+    if (view === "now" || view === "activity" || view === "github" || view === "vercel" || view === "media") updateActiveHomeView(view);
+  }));
+  tabView.querySelector<HTMLButtonElement>("[data-action=open-shortcuts]")?.addEventListener("click", () => updateActiveTab("shortcuts"));
   const volumeSlider = tabView.querySelector<HTMLInputElement>("#volume");
   volumeSlider?.addEventListener("input", (event) => {
     volume = Number((event.target as HTMLInputElement).value);
@@ -3689,7 +3796,22 @@ function updateActiveTab(tab: MenuTab) {
   });
   tabView.innerHTML = renderActiveTab();
   bindTabContent(tabView);
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  if (island) applyIslandVariables(island);
+  if (expanded) animateIsland(true);
   if (tab === "home" && previousTab !== "home") void refreshMediaInfo();
+}
+
+function updateActiveHomeView(view: HomeView) {
+  activeHomeView = view;
+  if (view === "github" || view === "vercel") activeHomeIntegration = view;
+  const tabView = app.querySelector<HTMLElement>(".tab-view");
+  if (!tabView || activeTab !== "home") return;
+  const subtitle = app.querySelector<HTMLElement>(".header-title small");
+  if (subtitle) subtitle.textContent = `${homeViewLabel(view)}${updatesPaused ? " · pausado" : ""}`;
+  tabView.innerHTML = renderHomePage();
+  bindTabContent(tabView);
+  if (view === "media") void refreshMediaInfo();
 }
 
 function renderDisplayOptions() {
@@ -3957,6 +4079,15 @@ function bindCodexApprovalButtons(container: ParentNode) {
 }
 
 function render() {
+  const previousIsland = app.querySelector<HTMLElement>(".edge-island");
+  const previousBody = previousIsland?.querySelector<HTMLElement>(".island-body");
+  const previousGeometry = expanded && previousBody && previousIsland?.dataset.edge === edge
+    ? {
+      width: previousBody.getBoundingClientRect().width,
+      height: previousBody.getBoundingClientRect().height,
+      radius: currentRadius(getComputedStyle(previousBody)),
+    }
+    : null;
   app.innerHTML = `
     <section class="edge-island ${expanded ? "is-expanded" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
@@ -3968,14 +4099,12 @@ function render() {
               <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">${menuIcon("pet")}</button>
               <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
             </nav>`}
-            ${onboardingOpen ? "" : `<div class="header-title"><strong>EDGE GHOSTY</strong><small>${activeTab === "home" ? "Visão geral" : activeTab === "pet" ? petName : "Atalhos"}${updatesPaused ? " · pausado" : ""}</small></div>`}
             ${onboardingOpen ? "" : `<div class="menu-header-actions">
               <button class="icon-button settings-button" data-action="settings" aria-label="Abrir configurações" title="Configurações">${menuIcon("settings")}</button>
               <button class="icon-button close-button" data-action="close" aria-label="Fechar" title="Fechar">${menuIcon("close")}</button>
             </div>`}
           </header>
           <main class="tab-view" role="tabpanel">${renderActiveTab()}</main>
-          ${onboardingOpen ? "" : '<footer><span>Ctrl + Shift + Espaço</span><span class="footer-hint">chat rápido do Ghosty</span></footer>'}
         </div>
         <div class="ghosty-inline-approval" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="ghosty-inline-approval-title">
           ${renderPetCharacter("ghosty-inline-approval-pet")}
@@ -4011,12 +4140,18 @@ function render() {
       <span class="task-completion-live" id="ghosty-completion-live" role="status" aria-live="polite"></span>
     </section>`;
 
+  if (activeTab === "home") {
+    const subtitle = app.querySelector<HTMLElement>(".header-title small");
+    if (subtitle) subtitle.textContent = `${homeViewLabel()}${updatesPaused ? " · pausado" : ""}`;
+  }
+
   const island = app.querySelector<HTMLElement>(".edge-island")!;
   applyIslandVariables(island);
   const islandContent = island.querySelector<HTMLElement>(".island-content")!;
   if (settingsOpen) islandContent.innerHTML = renderSettingsContent();
 
   const body = island.querySelector<HTMLElement>(".island-body")!;
+  if (previousGeometry) setBodyGeometry(body, previousGeometry.width, previousGeometry.height, previousGeometry.radius);
   publishNativeHitBounds(body);
   body.addEventListener("pointerenter", () => {
     if (hoverCloseTimer !== undefined) {
@@ -4092,6 +4227,8 @@ function render() {
     updateActiveTab(tabButton.dataset.tab as MenuTab);
   });
 
+  if (previousGeometry) animateIsland(true);
+
   
 }
 
@@ -4100,6 +4237,7 @@ async function startMainWindow() {
   void refreshAutoStartStatus();
   void refreshCodexHooksStatus();
   try { updatesPaused = await invoke<boolean>("is_updates_paused"); } catch { /* Tray not initialized in older app builds. */ }
+  refreshHomeStatusUi();
   void refreshGithubStatus();
   void refreshVercelStatus();
   if (githubRefreshInterval === undefined) {
@@ -4324,6 +4462,7 @@ void listen<boolean>("edge-ghosty-pause-updated", ({ payload }) => {
   refreshGithubCard();
   refreshGithubSettingsUi();
   refreshVercelSettingsUi();
+  refreshHomeStatusUi();
   if (!payload) {
     if (githubConnected) void refreshGithubSnapshot();
     if (vercelConnected) void refreshVercelSnapshot();
