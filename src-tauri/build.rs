@@ -5,8 +5,8 @@ fn main() {
     tauri_build::build();
 }
 
-// Tauri's Windows resource step expects an ICO even while developing. Keep a
-// tiny generated placeholder here until the final Edge Ghosty branding exists.
+// Keep a transparent fallback for older development checkouts that lack the
+// branded icon asset. The Windows installer uses the committed Edge Ghosty ICO.
 fn ensure_dev_icon() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let icon_path = manifest_dir.join("icons").join("icon.ico");

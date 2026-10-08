@@ -1,11 +1,12 @@
 {
   "name": "edge-ghosty",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:windows": "tauri build --bundles nsis",
     "tauri": "tauri"
   },
   "devDependencies": {
