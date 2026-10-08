@@ -2,6 +2,8 @@ import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { Tracked } from "./anim";
 import { PetMotionEngine, type PetState } from "./pet-motion";
 import { playGhostySound, setGhostySoundEnabled, setGhostySoundVolume } from "./sounds";
@@ -377,6 +379,11 @@ let vercelTeamId = localStorage.getItem(KEYS.vercelTeamId) ?? "";
 let vercelRefreshInterval: number | undefined;
 let soundEnabled = localStorage.getItem(KEYS.soundsEnabled) === "true";
 let soundVolume = readNumber(KEYS.soundVolume, 24, 0, 100);
+let availableAppUpdate: Update | null = null;
+let appUpdateChecking = false;
+let appUpdateInstalling = false;
+let appUpdateStatus = "O Ghosty verifica atualizações automaticamente.";
+let appUpdateCheckInterval: number | undefined;
 const codexApprovalExpiryTimers = new Map<string, number>();
 let approvalHitBoundsInterval: number | undefined;
 let approvalHitBoundsStopTimer: number | undefined;
@@ -4113,6 +4120,91 @@ function renderDisplayOptions() {
     </label>`).join("");
 }
 
+function paintAppUpdateUi() {
+  const status = app.querySelector<HTMLElement>("#app-update-status");
+  if (status) status.textContent = appUpdateStatus;
+  const checkButton = app.querySelector<HTMLButtonElement>("[data-action=check-app-update]");
+  if (checkButton) {
+    checkButton.disabled = appUpdateChecking || appUpdateInstalling;
+    checkButton.textContent = appUpdateChecking ? "Verificando…" : "Verificar agora";
+  }
+  const installButton = app.querySelector<HTMLButtonElement>("[data-action=install-app-update]");
+  if (installButton) {
+    installButton.hidden = !availableAppUpdate;
+    installButton.disabled = appUpdateChecking || appUpdateInstalling;
+    installButton.textContent = appUpdateInstalling ? "Instalando…" : "Instalar e reiniciar";
+  }
+  app.querySelectorAll<HTMLButtonElement>(".settings-button").forEach((button) => {
+    button.classList.toggle("has-app-update", Boolean(availableAppUpdate));
+    button.setAttribute("aria-label", availableAppUpdate ? "Configurações — atualização disponível" : "Abrir configurações");
+    button.title = availableAppUpdate ? "Atualização do Ghosty disponível" : "Configurações";
+  });
+}
+
+async function checkForAppUpdate(manual = false) {
+  if (appUpdateChecking || appUpdateInstalling) return;
+  if (window.location.port === "1420") {
+    if (manual) appUpdateStatus = "A verificação de atualizações fica disponível na versão instalada.";
+    paintAppUpdateUi();
+    return;
+  }
+  appUpdateChecking = true;
+  if (manual) appUpdateStatus = "Procurando uma versão nova…";
+  paintAppUpdateUi();
+  try {
+    const checkedUpdate = await checkAppUpdate();
+    if (availableAppUpdate && availableAppUpdate !== checkedUpdate) {
+      await availableAppUpdate.close().catch(() => undefined);
+    }
+    availableAppUpdate = checkedUpdate;
+    appUpdateStatus = availableAppUpdate
+      ? `A versão ${availableAppUpdate.version} está disponível.`
+      : "O Ghosty já está na versão mais recente.";
+  } catch {
+    appUpdateStatus = manual
+      ? "Não foi possível verificar agora. Confira a conexão e tente novamente."
+      : "Não foi possível consultar atualizações agora.";
+  } finally {
+    appUpdateChecking = false;
+    paintAppUpdateUi();
+  }
+}
+
+async function installAppUpdate() {
+  const update = availableAppUpdate;
+  if (!update || appUpdateInstalling) return;
+  appUpdateInstalling = true;
+  appUpdateStatus = `Baixando a versão ${update.version}…`;
+  paintAppUpdateUi();
+  try {
+    let downloadedBytes = 0;
+    let totalBytes = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        totalBytes = event.data.contentLength ?? 0;
+      } else if (event.event === "Progress") {
+        downloadedBytes += event.data.chunkLength;
+        const progress = totalBytes > 0 ? ` ${Math.min(100, Math.floor(downloadedBytes / totalBytes * 100))}%` : "";
+        appUpdateStatus = `Baixando a atualização…${progress}`;
+        paintAppUpdateUi();
+      } else if (event.event === "Finished") {
+        appUpdateStatus = "Instalação pronta. Reiniciando o Ghosty…";
+        paintAppUpdateUi();
+      }
+    });
+    appUpdateStatus = "A atualização foi iniciada. O instalador vai concluir e reiniciar o Ghosty.";
+    paintAppUpdateUi();
+    await relaunch();
+  } catch {
+    appUpdateInstalling = false;
+    const failedUpdate = availableAppUpdate;
+    availableAppUpdate = null;
+    if (failedUpdate) void failedUpdate.close().catch(() => undefined);
+    appUpdateStatus = "Não foi possível instalar a atualização. Tente novamente ou baixe o instalador no GitHub.";
+    paintAppUpdateUi();
+  }
+}
+
 function renderSettingsContent() {
   const lengthLabel = edge === "left" ? "Altura da barrinha" : "Largura da barrinha";
   return `
@@ -4125,6 +4217,14 @@ function renderSettingsContent() {
       <div class="settings-scroll">
         <section class="settings-context-card">
         <p class="settings-intro">Ajuste a barrinha e escolha a tela onde o Edge Ghosty aparece.</p>
+        <section class="control-card setting-card app-update-card">
+          <div class="setting-heading">Atualizações do Ghosty</div>
+          <small class="app-update-status" id="app-update-status" role="status">${escapeHtml(appUpdateStatus)}</small>
+          <div class="app-update-actions">
+            <button class="reset-button" data-action="check-app-update" type="button" ${appUpdateChecking || appUpdateInstalling ? "disabled" : ""}>${appUpdateChecking ? "Verificando…" : "Verificar agora"}</button>
+            <button class="reset-button" data-action="install-app-update" type="button" ${availableAppUpdate ? "" : "hidden"} ${appUpdateChecking || appUpdateInstalling ? "disabled" : ""}>${appUpdateInstalling ? "Instalando…" : "Instalar e reiniciar"}</button>
+          </div>
+        </section>
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-length">${lengthLabel}</label><output id="bar-length-value">${barLength} px</output></div>
           <input id="bar-length" type="range" min="${MIN_LENGTH}" max="${MAX_LENGTH}" step="${LENGTH_STEP}" value="${barLength}" />
@@ -4271,6 +4371,8 @@ function bindRange(
 }
 
 function bindSettings() {
+  app.querySelector<HTMLButtonElement>("[data-action=check-app-update]")?.addEventListener("click", () => void checkForAppUpdate(true));
+  app.querySelector<HTMLButtonElement>("[data-action=install-app-update]")?.addEventListener("click", () => void installAppUpdate());
   app.querySelector<HTMLButtonElement>("#codex-hooks-toggle")?.addEventListener("click", () => void toggleCodexHooks());
   app.querySelector<HTMLButtonElement>("[data-action=codex-hook-apply]")?.addEventListener("click", () => void applyCodexHookChange());
   app.querySelector<HTMLButtonElement>("[data-action=codex-hook-cancel]")?.addEventListener("click", () => {
@@ -4384,7 +4486,7 @@ function render() {
               <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
             </nav>`}
             ${onboardingOpen ? "" : `<div class="menu-header-actions">
-              <button class="icon-button settings-button" data-action="settings" aria-label="Abrir configurações" title="Configurações">${menuIcon("settings")}</button>
+              <button class="icon-button settings-button ${availableAppUpdate ? "has-app-update" : ""}" data-action="settings" aria-label="${availableAppUpdate ? "Configurações — atualização disponível" : "Abrir configurações"}" title="${availableAppUpdate ? "Atualização do Ghosty disponível" : "Configurações"}">${menuIcon("settings")}</button>
               <button class="icon-button close-button" data-action="close" aria-label="Fechar" title="Fechar">${menuIcon("close")}</button>
             </div>`}
           </header>
@@ -4524,6 +4626,10 @@ function render() {
 
 async function startMainWindow() {
   render();
+  void checkForAppUpdate();
+  if (appUpdateCheckInterval === undefined) {
+    appUpdateCheckInterval = window.setInterval(() => void checkForAppUpdate(), 6 * 60 * 60 * 1000);
+  }
   void refreshAutoStartStatus();
   void refreshCodexHooksStatus();
   try { updatesPaused = await invoke<boolean>("is_updates_paused"); } catch { /* Tray not initialized in older app builds. */ }
