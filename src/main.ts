@@ -13,7 +13,18 @@ type PetSkin = "pearl" | "smoke" | "midnight" | "mint" | "coral" | "lavender";
 type PetAccessory = "none" | "star" | "bow" | "halo" | "leaf" | "crown";
 type FocusState = { durationMs: number; remainingMs: number; endsAt: number; running: boolean; startedAt: number };
 type FocusHistoryEntry = { id: string; startedAt: number; endedAt: number; durationMs: number; completed: boolean };
-type MediaInfo = { title: string; artist: string; playing: boolean };
+type MediaInfo = {
+  title: string;
+  artist: string;
+  playing: boolean;
+  source: string;
+  trackId: string;
+  artworkDataUrl: string;
+  positionMs: number;
+  durationMs: number;
+  canSeek: boolean;
+};
+type AudioAppVolume = { processId: number; name: string; volume: number };
 type Edge = "left" | "top" | "bottom";
 type MenuTab = "home" | "pet" | "shortcuts";
 type HomeView = "now" | "activity" | "github" | "vercel" | "media";
@@ -267,6 +278,12 @@ function readDisplayIds(): string[] {
 }
 
 let volume = 62;
+let volumeMixerOpen = false;
+let audioMixerApps: AudioAppVolume[] = [];
+let audioMixerRefreshBusy = false;
+let mediaRefreshBusy = false;
+let mediaUpdatedAt = 0;
+let mediaSeekDragging = false;
 let expanded = onboardingOpen;
 let settingsOpen = false;
 let activeTab: MenuTab = "home";
@@ -320,7 +337,10 @@ let autoStartEnabled = false;
 let autoStartLoading = true;
 let autoStartBusy = false;
 let autoStartError = "";
-let mediaInfo: MediaInfo = { title: "", artist: "", playing: false };
+let mediaInfo: MediaInfo = {
+  title: "", artist: "", playing: false, source: "", trackId: "", artworkDataUrl: "",
+  positionMs: 0, durationMs: 0, canSeek: false,
+};
 let codexHooksEnabled = false;
 let codexHooksBusy = true;
 let codexHooksNeedsReview = false;
@@ -1187,13 +1207,15 @@ function freezeIslandGeometry(island: HTMLElement) {
 
 function expandedIslandSize() {
   const horizontal = edge !== "left";
+  const preferredWidth = activeTab === "home" && activeHomeView === "media" ? horizontal ? 1000 : 420
+    : horizontal ? 960 : 420;
   const preferredHeight = settingsOpen || onboardingOpen
     ? horizontal ? 380 : 620
     : activeTab === "home" ? horizontal ? 210 : 480
       : activeTab === "pet" ? horizontal ? 330 : 620
         : horizontal ? 380 : 620;
   return {
-    width: Math.min(horizontal ? 800 : 420, Math.max(220, window.innerWidth - (horizontal ? 40 : 32))),
+    width: Math.min(preferredWidth, Math.max(220, window.innerWidth - (horizontal ? 40 : 32))),
     height: Math.min(preferredHeight, Math.max(180, window.innerHeight - (horizontal ? 32 : 48))),
   };
 }
@@ -1383,6 +1405,16 @@ function formatDuration(ms: number) {
   return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+function formatMediaTime(ms: number) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const hours = Math.floor(totalSeconds / 3600);
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`
+    : `${minutes}:${seconds}`;
+}
+
 function homeViewLabel(view: HomeView = activeHomeView) {
   return view === "activity" ? "Codex" : view === "github" ? "GitHub" : view === "vercel" ? "Vercel" : view === "media" ? "Mídia" : "Agora";
 }
@@ -1400,16 +1432,29 @@ function renderHomePage() {
     : activeHomeView === "github" || activeHomeView === "vercel" ? renderHomeIntegrations()
       : activeHomeView === "media" ? renderHomeMedia()
         : renderHomeNow(status);
+  const mediaArtworkStyle = activeHomeView === "media" && mediaInfo.artworkDataUrl
+    ? `style="--media-artwork:url('${escapeHtml(mediaInfo.artworkDataUrl)}')"`
+    : "";
   return `
-    <div class="coucou-home" data-home-panel="${activeHomeView}">
-      <section class="coucou-focus-card" data-home-status="${status.state}" aria-label="${homeViewLabel()}">
+    <div class="coucou-home" data-home-panel="${activeHomeView}" data-volume-mixer="${volumeMixerOpen ? "open" : "closed"}">
+      <section class="coucou-focus-card" ${mediaArtworkStyle} data-home-status="${status.state}" aria-label="${homeViewLabel()}">
         <div class="coucou-focus-pet">${renderPetCharacter("pet-home")}</div>
         <div class="coucou-focus-content">${content}</div>
       </section>
-      <nav class="coucou-pill-card" aria-label="Mudar cartão em destaque">
+      ${activeHomeView === "media" ? renderHomeMasterVolume() : ""}
+      <nav class="coucou-pill-card" aria-label="Mudar cartão em destaque" ${activeHomeView === "media" && volumeMixerOpen ? 'aria-hidden="true" inert' : ""}>
         ${views.filter(({ id }) => id !== activeHomeView).map(({ id, label, accent, glyph }) => `<button class="coucou-pill" type="button" style="--pill-accent:${accent}" data-action="home-view" data-home-view="${id}" aria-label="Mostrar ${label}"><span class="coucou-pill-glyph" aria-hidden="true">${glyph}</span><span>${label}</span></button>`).join("")}
       </nav>
+      ${activeHomeView === "media" ? renderAudioMixerPanel() : ""}
     </div>`;
+}
+
+function renderHomeMasterVolume() {
+  return `<label class="home-master-volume" title="Volume principal do sistema">
+    <span class="home-master-volume-icon" aria-hidden="true">${menuIcon("volume")}</span>
+    <input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume principal do sistema" aria-orientation="vertical" />
+    <output id="volume-value">${volume}%</output>
+  </label>`;
 }
 
 function renderHomeNow(status: ReturnType<typeof homeStatusPresentation>) {
@@ -1451,15 +1496,33 @@ function renderHomeActivity() {
 
 function renderHomeMedia() {
   return `<div class="coucou-card-copy home-media-view">
-    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>Mídia</strong><span>Windows</span></div>
-    <strong class="coucou-card-title media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong>
-    <small class="coucou-card-description media-artist">${escapeHtml(mediaInfo.artist || "Quando algo tocar, aparece aqui")}</small>
+    <div class="coucou-card-heading"><i aria-hidden="true"></i><strong>Mídia</strong><span>Windows</span><button class="media-mixer-toggle" type="button" data-action="media-mixer" aria-expanded="${volumeMixerOpen}" title="Abrir controles de volume por aplicativo">${volumeMixerOpen ? "Fechar mixer" : "Volume dos apps"}</button></div>
+    <div class="media-player-main">
+      <div class="media-track-copy"><strong class="media-title">${escapeHtml(mediaInfo.title || "Nada tocando agora")}</strong><small class="media-artist">${escapeHtml(mediaInfo.artist || "Quando algo tocar, aparece aqui")}</small></div>
+    </div>
+    <div class="media-progress-row"><span class="media-position">${formatMediaTime(mediaInfo.positionMs)}</span><input id="media-progress" type="range" min="0" max="${Math.max(1, mediaInfo.durationMs)}" value="${Math.min(mediaInfo.positionMs, mediaInfo.durationMs || 0)}" aria-label="Progresso da faixa" ${mediaInfo.canSeek ? "" : "disabled"} /><span class="media-duration">${formatMediaTime(mediaInfo.durationMs)}</span></div>
     <div class="coucou-media-bottom"><div class="media-controls">
         <button data-action="media-previous" aria-label="Faixa anterior" title="Anterior">${menuIcon("previous")}</button>
         <button class="media-play" data-action="media-toggle" aria-label="Reproduzir ou pausar" title="Reproduzir ou pausar"><span class="media-play-icon">${menuIcon(mediaInfo.playing ? "pause" : "play")}</span></button>
         <button data-action="media-next" aria-label="Próxima faixa" title="Próxima">${menuIcon("next")}</button>
-      </div><label class="volume-control"><span class="volume-icon">${menuIcon("volume")}</span><input id="volume" type="range" min="0" max="100" value="${volume}" aria-label="Volume do sistema" /><output id="volume-value">${volume}%</output></label></div>
+      </div></div>
   </div>`;
+}
+
+function renderAudioMixerPanel() {
+  return `<aside class="audio-mixer-panel" data-open="${volumeMixerOpen}" aria-hidden="${!volumeMixerOpen}" aria-label="Volume por aplicativo" ${volumeMixerOpen ? "" : "inert"}>
+    <div class="audio-mixer-heading"><div><small>MIXER DE ÁUDIO</small><strong>Volume por app</strong></div><button type="button" data-action="media-mixer-close" aria-label="Fechar mixer">×</button></div>
+    <div class="audio-app-list">${renderAudioMixerApps()}</div>
+  </aside>`;
+}
+
+function renderAudioMixerApps() {
+  if (audioMixerApps.length === 0) return '<p class="audio-app-empty">Abra ou retome um player para ajustar o volume dele aqui.</p>';
+  return audioMixerApps.map((audioApp) => `<label class="audio-app-row" data-app-id="${audioApp.processId}">
+    <span class="audio-app-name" title="${escapeHtml(audioApp.name)}"><i aria-hidden="true">${escapeHtml(audioApp.name.slice(0, 1).toUpperCase())}</i><strong>${escapeHtml(audioApp.name)}</strong></span>
+    <input class="audio-app-volume" type="range" min="0" max="100" value="${audioApp.volume}" data-app-id="${audioApp.processId}" aria-label="Volume de ${escapeHtml(audioApp.name)}" aria-orientation="vertical" />
+    <output>${audioApp.volume}%</output>
+  </label>`).join("");
 }
 
 function homeStatusPresentation() {
@@ -3399,14 +3462,124 @@ function tickFeatures() {
 }
 
 async function refreshMediaInfo() {
+  if (mediaRefreshBusy) return;
+  mediaRefreshBusy = true;
   try {
-    mediaInfo = await invoke<MediaInfo>("get_media_info");
+    const nextInfo = await invoke<MediaInfo>("get_media_info", {
+      knownTrackId: mediaInfo.artworkDataUrl ? mediaInfo.trackId : null,
+    });
+    if (nextInfo.trackId === mediaInfo.trackId && !nextInfo.artworkDataUrl) {
+      nextInfo.artworkDataUrl = mediaInfo.artworkDataUrl;
+    }
+    mediaInfo = nextInfo;
   } catch {
-    mediaInfo = { title: "", artist: "", playing: false };
+    mediaInfo = {
+      title: "", artist: "", playing: false, source: "", trackId: "", artworkDataUrl: "",
+      positionMs: 0, durationMs: 0, canSeek: false,
+    };
+  } finally {
+    mediaRefreshBusy = false;
   }
- app.querySelectorAll<HTMLElement>(".media-title").forEach((element) => { element.textContent = mediaInfo.title || "Nada tocando agora"; });
- app.querySelectorAll<HTMLElement>(".media-artist").forEach((element) => { element.textContent = mediaInfo.artist || "Quando algo tocar, aparece aqui"; });
+  mediaUpdatedAt = Date.now();
+  paintMediaInfo();
+}
+
+function currentMediaPosition() {
+  const elapsed = mediaInfo.playing ? Math.max(0, Date.now() - mediaUpdatedAt) : 0;
+  const position = mediaInfo.positionMs + elapsed;
+  return mediaInfo.durationMs > 0 ? Math.min(position, mediaInfo.durationMs) : position;
+}
+
+function paintMediaInfo() {
+  app.querySelectorAll<HTMLElement>(".media-title").forEach((element) => { element.textContent = mediaInfo.title || "Nada tocando agora"; });
+  app.querySelectorAll<HTMLElement>(".media-artist").forEach((element) => { element.textContent = mediaInfo.artist || "Quando algo tocar, aparece aqui"; });
   app.querySelectorAll<HTMLElement>(".media-play-icon").forEach((element) => { element.innerHTML = menuIcon(mediaInfo.playing ? "pause" : "play"); });
+  const mediaCard = app.querySelector<HTMLElement>(".coucou-home[data-home-panel=media] .coucou-focus-card");
+  if (mediaCard) {
+    if (mediaInfo.artworkDataUrl) mediaCard.style.setProperty("--media-artwork", `url('${mediaInfo.artworkDataUrl}')`);
+    else mediaCard.style.removeProperty("--media-artwork");
+  }
+  const progress = app.querySelector<HTMLInputElement>("#media-progress");
+  const duration = Math.max(0, mediaInfo.durationMs);
+  if (progress) {
+    progress.max = String(Math.max(1, duration));
+    progress.disabled = !mediaInfo.canSeek || duration <= 0;
+    if (!mediaSeekDragging) progress.value = String(Math.min(currentMediaPosition(), duration || 0));
+  }
+  const positionLabel = app.querySelector<HTMLElement>(".media-position");
+  if (positionLabel) positionLabel.textContent = formatMediaTime(mediaSeekDragging && progress ? Number(progress.value) : currentMediaPosition());
+  const durationLabel = app.querySelector<HTMLElement>(".media-duration");
+  if (durationLabel) durationLabel.textContent = formatMediaTime(duration);
+}
+
+function bindAudioMixerInputs(root: ParentNode) {
+  root.querySelectorAll<HTMLInputElement>(".audio-app-volume").forEach((slider) => {
+    if (slider.dataset.bound === "true") return;
+    slider.dataset.bound = "true";
+    slider.addEventListener("input", () => {
+      const processId = Number(slider.dataset.appId);
+      const value = Number(slider.value);
+      const appVolume = audioMixerApps.find((item) => item.processId === processId);
+      if (appVolume) appVolume.volume = value;
+      const output = slider.closest<HTMLElement>(".audio-app-row")?.querySelector<HTMLOutputElement>("output");
+      if (output) output.value = `${value}%`;
+      void invoke("set_app_volume", { processId, value }).catch(() => undefined);
+    });
+  });
+}
+
+async function refreshAudioMixer() {
+  if (audioMixerRefreshBusy) return;
+  audioMixerRefreshBusy = true;
+  try {
+    audioMixerApps = await invoke<AudioAppVolume[]>("get_app_volumes");
+  } catch {
+    audioMixerApps = [];
+  } finally {
+    audioMixerRefreshBusy = false;
+  }
+  const list = app.querySelector<HTMLElement>(".audio-app-list");
+  if (!list) return;
+  const nextIds = audioMixerApps.map((item) => item.processId).join(",");
+  const currentIds = [...list.querySelectorAll<HTMLElement>(".audio-app-row")].map((row) => row.dataset.appId).join(",");
+  if (nextIds !== currentIds) {
+    list.innerHTML = renderAudioMixerApps();
+    bindAudioMixerInputs(list);
+    return;
+  }
+  for (const audioApp of audioMixerApps) {
+    const row = list.querySelector<HTMLElement>(`.audio-app-row[data-app-id="${audioApp.processId}"]`);
+    const slider = row?.querySelector<HTMLInputElement>(".audio-app-volume");
+    const output = row?.querySelector<HTMLOutputElement>("output");
+    if (slider && document.activeElement !== slider) slider.value = String(audioApp.volume);
+    if (output) output.value = `${audioApp.volume}%`;
+  }
+}
+
+function setVolumeMixerOpen(value: boolean) {
+  if (volumeMixerOpen === value) return;
+  volumeMixerOpen = value;
+  const home = app.querySelector<HTMLElement>(".coucou-home[data-home-panel=media]");
+  if (!home) return;
+  home.dataset.volumeMixer = value ? "open" : "closed";
+  const toggle = home.querySelector<HTMLButtonElement>("[data-action=media-mixer]");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(value));
+    toggle.textContent = value ? "Fechar mixer" : "Volume dos apps";
+    toggle.title = value ? "Fechar controles de volume por aplicativo" : "Abrir controles de volume por aplicativo";
+  }
+  const panel = home.querySelector<HTMLElement>(".audio-mixer-panel");
+  if (panel) {
+    panel.dataset.open = String(value);
+    panel.setAttribute("aria-hidden", String(!value));
+    panel.inert = !value;
+  }
+  const pills = home.querySelector<HTMLElement>(".coucou-pill-card");
+  if (pills) {
+    pills.setAttribute("aria-hidden", String(value));
+    pills.inert = value;
+  }
+  if (value) void refreshAudioMixer();
 }
 
 function launchShortcut(shortcut: Shortcut) {
@@ -3579,6 +3752,7 @@ async function bindNativeFileDrop() {
 
 function bindTabContent(tabView: HTMLElement) {
   bindPetInteractions(tabView);
+  bindAudioMixerInputs(tabView);
   tabView.querySelectorAll<HTMLButtonElement>("[data-action=home-view]").forEach((button) => button.addEventListener("click", () => {
     const view = button.dataset.homeView;
     if (view === "now" || view === "activity" || view === "github" || view === "vercel" || view === "media") updateActiveHomeView(view);
@@ -3590,6 +3764,23 @@ function bindTabContent(tabView: HTMLElement) {
     const output = tabView.querySelector("#volume-value");
     if (output) output.textContent = `${volume}%`;
     void invoke("system_volume", { value: volume }).catch(() => undefined);
+  });
+
+  tabView.querySelector<HTMLButtonElement>("[data-action=media-mixer]")?.addEventListener("click", () => setVolumeMixerOpen(!volumeMixerOpen));
+  tabView.querySelector<HTMLButtonElement>("[data-action=media-mixer-close]")?.addEventListener("click", () => setVolumeMixerOpen(false));
+  const mediaProgress = tabView.querySelector<HTMLInputElement>("#media-progress");
+  mediaProgress?.addEventListener("pointercancel", () => { mediaSeekDragging = false; });
+  mediaProgress?.addEventListener("input", () => {
+    mediaSeekDragging = true;
+    const position = tabView.querySelector<HTMLElement>(".media-position");
+    if (position) position.textContent = formatMediaTime(Number(mediaProgress.value));
+  });
+  mediaProgress?.addEventListener("change", () => {
+    const positionMs = Number(mediaProgress.value);
+    void invoke("seek_media_position", { positionMs })
+      .then(() => refreshMediaInfo())
+      .catch(() => refreshMediaInfo())
+      .finally(() => { mediaSeekDragging = false; });
   });
 
   tabView.querySelectorAll<HTMLButtonElement>("[data-action^=media-]").forEach((button) => {
@@ -3786,6 +3977,7 @@ function refreshUtilityPopupSubtitle() {
 function updateActiveTab(tab: MenuTab) {
   const previousTab = activeTab;
   activeTab = tab;
+  if (tab !== "home") volumeMixerOpen = false;
   const tabView = app.querySelector<HTMLElement>(".tab-view");
   if (!tabView) return;
 
@@ -3804,6 +3996,7 @@ function updateActiveTab(tab: MenuTab) {
 
 function updateActiveHomeView(view: HomeView) {
   activeHomeView = view;
+  if (view !== "media") volumeMixerOpen = false;
   if (view === "github" || view === "vercel") activeHomeIntegration = view;
   const tabView = app.querySelector<HTMLElement>(".tab-view");
   if (!tabView || activeTab !== "home") return;
@@ -3811,7 +4004,13 @@ function updateActiveHomeView(view: HomeView) {
   if (subtitle) subtitle.textContent = `${homeViewLabel(view)}${updatesPaused ? " · pausado" : ""}`;
   tabView.innerHTML = renderHomePage();
   bindTabContent(tabView);
-  if (view === "media") void refreshMediaInfo();
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  if (island) applyIslandVariables(island);
+  if (expanded) animateIsland(true);
+  if (view === "media") {
+    void refreshMediaInfo();
+    if (volumeMixerOpen) void refreshAudioMixer();
+  }
 }
 
 function renderDisplayOptions() {
@@ -4250,6 +4449,22 @@ async function startMainWindow() {
       if (vercelConnected && !updatesPaused) void refreshVercelSnapshot();
     }, 5 * 60_000);
   }
+  let nextMediaRefreshAt = 0;
+  let nextMixerRefreshAt = 0;
+  window.setInterval(() => {
+    const mediaViewOpen = expanded && activeTab === "home" && activeHomeView === "media";
+    if (!mediaViewOpen) return;
+    paintMediaInfo();
+    const now = Date.now();
+    if (now >= nextMediaRefreshAt) {
+      nextMediaRefreshAt = now + 1500;
+      void refreshMediaInfo();
+    }
+    if (volumeMixerOpen && now >= nextMixerRefreshAt) {
+      nextMixerRefreshAt = now + 2200;
+      void refreshAudioMixer();
+    }
+  }, 250);
   window.setInterval(() => void pollCodexHookEvents(), 300);
   await bindNativeFileDrop();
   void invoke<number>("get_system_volume").then((value) => {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::process::Command;
 use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
@@ -10,9 +11,12 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, POINT};
+use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, POINT};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::Media::Audio::{
+    eConsole, eRender, AudioSessionStateExpired, IAudioSessionControl2,
+    IAudioSessionManager2, IMMDeviceEnumerator, MMDeviceEnumerator, ISimpleAudioVolume,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
@@ -23,6 +27,10 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::System::Ole::CF_UNICODETEXT;
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, GetAsyncKeyState, KEYEVENTF_KEYUP, VK_LBUTTON, VK_MEDIA_NEXT_TRACK,
     VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
@@ -31,7 +39,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SW_SHOWNORMAL,
 };
-use windows::core::PCWSTR;
+use windows::core::{Interface, PCWSTR, PWSTR};
 
 mod codex_hooks;
 mod codex_chat;
@@ -87,6 +95,34 @@ struct MediaInfo {
     title: String,
     artist: String,
     playing: bool,
+    source: String,
+    track_id: String,
+    artwork_data_url: String,
+    position_ms: u64,
+    duration_ms: u64,
+    can_seek: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AudioAppVolume {
+    process_id: u32,
+    name: String,
+    volume: u8,
+}
+
+fn default_media_info() -> MediaInfo {
+    MediaInfo {
+        title: String::new(),
+        artist: String::new(),
+        playing: false,
+        source: String::new(),
+        track_id: String::new(),
+        artwork_data_url: String::new(),
+        position_ms: 0,
+        duration_ms: 0,
+        can_seek: false,
+    }
 }
 
 #[derive(Serialize)]
@@ -159,6 +195,135 @@ fn get_system_volume() -> Result<u8, String> {
             .GetMasterVolumeLevelScalar()
             .map_err(|error| format!("read volume: {error}"))?;
         Ok((scalar * 100.0).round().clamp(0.0, 100.0) as u8)
+    }
+}
+
+unsafe fn default_audio_session_manager() -> Result<IAudioSessionManager2, String> {
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    let device_enumerator: IMMDeviceEnumerator =
+        CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+            .map_err(|error| format!("audio enumerator: {error}"))?;
+    let device = device_enumerator
+        .GetDefaultAudioEndpoint(eRender, eConsole)
+        .map_err(|error| format!("default audio device: {error}"))?;
+    let manager: IAudioSessionManager2 = device
+        .Activate(CLSCTX_ALL, None)
+        .map_err(|error| format!("audio session manager: {error}"))?;
+    Ok(manager)
+}
+
+fn audio_process_name(process_id: u32) -> String {
+    let process = match unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+    } {
+        Ok(process) => process,
+        Err(_) => return format!("Aplicativo {process_id}"),
+    };
+    let mut path_buffer = vec![0u16; 32_768];
+    let mut path_length = path_buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(path_buffer.as_mut_ptr()),
+            &mut path_length,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    if result.is_err() {
+        return format!("Aplicativo {process_id}");
+    }
+    let path = String::from_utf16_lossy(&path_buffer[..path_length as usize]);
+    let executable = Path::new(&path)
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| format!("app-{process_id}"));
+    match executable.as_str() {
+        "spotify" => "Spotify".to_string(),
+        "chrome" => "Google Chrome".to_string(),
+        "msedge" => "Microsoft Edge".to_string(),
+        "firefox" => "Firefox".to_string(),
+        "vlc" => "VLC media player".to_string(),
+        "discord" => "Discord".to_string(),
+        "teams" | "ms-teams" => "Microsoft Teams".to_string(),
+        "zoom" => "Zoom".to_string(),
+        "spotifywebhelper" => "Spotify".to_string(),
+        _ => {
+            let mut characters = executable.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_else(|| format!("Aplicativo {process_id}"))
+        }
+    }
+}
+
+#[tauri::command]
+fn get_app_volumes() -> Result<Vec<AudioAppVolume>, String> {
+    unsafe {
+        let manager = default_audio_session_manager()?;
+        let sessions = manager
+            .GetSessionEnumerator()
+            .map_err(|error| format!("audio session list: {error}"))?;
+        let count = sessions
+            .GetCount()
+            .map_err(|error| format!("audio session count: {error}"))?;
+        let mut apps = BTreeMap::<u32, AudioAppVolume>::new();
+        for index in 0..count {
+            let Ok(control) = sessions.GetSession(index) else { continue };
+            let Ok(state) = control.GetState() else { continue };
+            if state == AudioSessionStateExpired { continue; }
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else { continue };
+            let Ok(process_id) = control2.GetProcessId() else { continue };
+            if process_id == 0 || process_id == std::process::id() { continue; }
+            let name = audio_process_name(process_id);
+            if name.eq_ignore_ascii_case("Msedgewebview2") { continue; }
+            let Ok(audio_volume) = control.cast::<ISimpleAudioVolume>() else { continue };
+            let Ok(level) = audio_volume.GetMasterVolume() else { continue };
+            apps.entry(process_id).or_insert(AudioAppVolume {
+                process_id,
+                name,
+                volume: (level * 100.0).round().clamp(0.0, 100.0) as u8,
+            });
+        }
+        let mut result = apps.into_values().collect::<Vec<_>>();
+        result.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        Ok(result)
+    }
+}
+
+#[tauri::command]
+fn set_app_volume(process_id: u32, value: u8) -> Result<u8, String> {
+    if process_id == 0 || process_id == std::process::id() {
+        return Err("Esse processo não pode ser ajustado pelo mixer.".to_string());
+    }
+    unsafe {
+        let manager = default_audio_session_manager()?;
+        let sessions = manager
+            .GetSessionEnumerator()
+            .map_err(|error| format!("audio session list: {error}"))?;
+        let count = sessions
+            .GetCount()
+            .map_err(|error| format!("audio session count: {error}"))?;
+        let mut matched = false;
+        for index in 0..count {
+            let Ok(control) = sessions.GetSession(index) else { continue };
+            let Ok(state) = control.GetState() else { continue };
+            if state == AudioSessionStateExpired { continue; }
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else { continue };
+            if control2.GetProcessId().ok() != Some(process_id) { continue; }
+            let Ok(audio_volume) = control.cast::<ISimpleAudioVolume>() else { continue };
+            if audio_volume
+                .SetMasterVolume(value.min(100) as f32 / 100.0, std::ptr::null())
+                .is_ok()
+            {
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err("O aplicativo não está com uma sessão de áudio ativa.".to_string());
+        }
+        Ok(value.min(100))
     }
 }
 
@@ -237,10 +402,11 @@ fn media_control(action: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_media_info() -> MediaInfo {
+fn get_media_info(known_track_id: Option<String>) -> MediaInfo {
     const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$knownTrackId = $env:EDGE_GHOSTY_KNOWN_TRACK_ID
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() |
   Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } |
@@ -253,15 +419,62 @@ $managerType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionM
 $managerRequest = $managerType.GetMethod('RequestAsync').Invoke($null, @())
 $manager = Await-WinRT $managerRequest $managerType
 $session = $manager.GetCurrentSession()
-if ($null -eq $session) { [pscustomobject]@{ title = ''; artist = ''; playing = $false } | ConvertTo-Json -Compress; exit }
+if ($null -eq $session) { [pscustomobject]@{ title = ''; artist = ''; playing = $false; source = ''; trackId = ''; artworkDataUrl = ''; positionMs = 0; durationMs = 0; canSeek = $false } | ConvertTo-Json -Compress; exit }
 $propsType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties, Windows.Media.Control, ContentType = WindowsRuntime]
 $props = Await-WinRT ($session.TryGetMediaPropertiesAsync()) $propsType
 $playback = $session.GetPlaybackInfo()
-[pscustomobject]@{ title = [string]$props.Title; artist = [string]$props.Artist; playing = ([string]$playback.PlaybackStatus -eq 'Playing') } | ConvertTo-Json -Compress
+$timeline = $session.GetTimelineProperties()
+$source = [string]$session.SourceAppUserModelId
+$startTicks = [long]$timeline.StartTime.Ticks
+$durationMs = [Math]::Max(0, [long][Math]::Floor(([long]$timeline.EndTime.Ticks - $startTicks) / 10000))
+$positionMs = [Math]::Max(0, [long][Math]::Floor(([long]$timeline.Position.Ticks - $startTicks) / 10000))
+if ($durationMs -gt 0) { $positionMs = [Math]::Min($positionMs, $durationMs) }
+$trackId = $source + '|' + [string]$props.Title + '|' + [string]$props.Artist + '|' + [string]$props.AlbumTitle
+$artworkDataUrl = ''
+if ($knownTrackId -ne $trackId -and $null -ne $props.Thumbnail) {
+  try {
+    $artStreamType = [Windows.Storage.Streams.IRandomAccessStreamWithContentType, Windows.Storage.Streams, ContentType = WindowsRuntime]
+    $artStream = Await-WinRT ($props.Thumbnail.OpenReadAsync()) $artStreamType
+    $asStreamMethod = [System.IO.WindowsRuntimeStreamExtensions].GetMethods() |
+      Where-Object { $_.Name -eq 'AsStream' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IRandomAccessStream' } |
+      Select-Object -First 1
+    if ($null -eq $asStreamMethod) { throw 'Conversor de stream do Windows indisponível' }
+    $managedStream = $asStreamMethod.Invoke($null, @($artStream))
+    $memoryStream = [System.IO.MemoryStream]::new()
+    $managedStream.CopyTo($memoryStream)
+    $mime = [string]$artStream.ContentType
+    $artworkBytes = $memoryStream.ToArray()
+    if (-not $mime.StartsWith('image/')) {
+      $mime = 'image/jpeg'
+      if ($artworkBytes.Length -ge 8 -and $artworkBytes[0] -eq 137 -and $artworkBytes[1] -eq 80 -and $artworkBytes[2] -eq 78 -and $artworkBytes[3] -eq 71) { $mime = 'image/png' }
+      elseif ($artworkBytes.Length -ge 3 -and $artworkBytes[0] -eq 255 -and $artworkBytes[1] -eq 216) { $mime = 'image/jpeg' }
+      elseif ($artworkBytes.Length -ge 6 -and [System.Text.Encoding]::ASCII.GetString($artworkBytes, 0, 4) -eq 'GIF8') { $mime = 'image/gif' }
+      elseif ($artworkBytes.Length -ge 12 -and [System.Text.Encoding]::ASCII.GetString($artworkBytes, 0, 4) -eq 'RIFF' -and [System.Text.Encoding]::ASCII.GetString($artworkBytes, 8, 4) -eq 'WEBP') { $mime = 'image/webp' }
+    }
+    $artworkDataUrl = 'data:' + $mime + ';base64,' + [Convert]::ToBase64String($artworkBytes)
+    $managedStream.Dispose()
+    $memoryStream.Dispose()
+  } catch { $artworkDataUrl = '' }
+}
+$canSeek = $false
+if ($null -ne $playback.Controls) { $canSeek = [bool]$playback.Controls.IsPlaybackPositionEnabled }
+[pscustomobject]@{
+  title = [string]$props.Title
+  artist = [string]$props.Artist
+  playing = ([string]$playback.PlaybackStatus -eq 'Playing')
+  source = $source
+  trackId = $trackId
+  artworkDataUrl = $artworkDataUrl
+  positionMs = $positionMs
+  durationMs = $durationMs
+  canSeek = $canSeek
+} | ConvertTo-Json -Compress
 "#;
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
-        .output();
+        .env("EDGE_GHOSTY_KNOWN_TRACK_ID", known_track_id.unwrap_or_default());
+    let output = command.output();
     if let Ok(output) = output {
         if output.status.success() {
             if let Ok(info) = serde_json::from_slice::<MediaInfo>(&output.stdout) {
@@ -269,7 +482,46 @@ $playback = $session.GetPlaybackInfo()
             }
         }
     }
-    MediaInfo { title: String::new(), artist: String::new(), playing: false }
+    default_media_info()
+}
+
+#[tauri::command]
+fn seek_media_position(position_ms: u64) -> Result<(), String> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+  Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } |
+  Select-Object -First 1
+function Await-WinRT($operation, $resultType) {
+  $task = $asTask.MakeGenericMethod($resultType).Invoke($null, @($operation))
+  $task.GetAwaiter().GetResult()
+}
+$managerType = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime]
+$managerRequest = $managerType.GetMethod('RequestAsync').Invoke($null, @())
+$manager = Await-WinRT $managerRequest $managerType
+$session = $manager.GetCurrentSession()
+if ($null -eq $session) { exit 2 }
+$timeline = $session.GetTimelineProperties()
+$playback = $session.GetPlaybackInfo()
+if ($null -eq $playback.Controls -or -not $playback.Controls.IsPlaybackPositionEnabled) { exit 3 }
+$durationMs = [Math]::Max(0, [long][Math]::Floor(([long]$timeline.EndTime.Ticks - [long]$timeline.StartTime.Ticks) / 10000))
+$requestedMs = [Math]::Max(0, [long]$env:EDGE_GHOSTY_POSITION_MS)
+if ($durationMs -gt 0) { $requestedMs = [Math]::Min($requestedMs, $durationMs) }
+$requestedTicks = [long]$timeline.StartTime.Ticks + ($requestedMs * 10000)
+$success = Await-WinRT ($session.TryChangePlaybackPositionAsync([long]$requestedTicks)) ([System.Boolean])
+if (-not $success) { exit 4 }
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
+        .env("EDGE_GHOSTY_POSITION_MS", position_ms.to_string())
+        .output()
+        .map_err(|error| format!("iniciar busca da faixa: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("O player atual não permite buscar nessa faixa.".to_string())
+    }
 }
 
 #[tauri::command]
@@ -859,10 +1111,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             system_volume,
             get_system_volume,
+            get_app_volumes,
+            set_app_volume,
             read_clipboard_text,
             write_clipboard_text,
             media_control,
             get_media_info,
+            seek_media_position,
             open_targets,
             pocket_file_metadata,
             run_shortcut,
