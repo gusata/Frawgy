@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const CHAT_HOME_NAME: &str = "edge-ghosty-chat";
 const MAX_MESSAGE_CHARS: usize = 8_000;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Default)]
 pub struct CodexChatState {
@@ -259,7 +261,8 @@ fn codex_command(home: &Path) -> Result<Command, String> {
         .current_dir(home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
     Ok(command)
 }
 
