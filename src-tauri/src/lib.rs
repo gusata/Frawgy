@@ -49,6 +49,8 @@ mod github;
 mod vercel;
 mod tray;
 
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayInfo {
@@ -473,7 +475,8 @@ if ($null -ne $playback.Controls) { $canSeek = [bool]$playback.Controls.IsPlayba
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
-        .env("EDGE_GHOSTY_KNOWN_TRACK_ID", known_track_id.unwrap_or_default());
+        .env("EDGE_GHOSTY_KNOWN_TRACK_ID", known_track_id.unwrap_or_default())
+        .creation_flags(CREATE_NO_WINDOW);
     let output = command.output();
     if let Ok(output) = output {
         if output.status.success() {
@@ -515,6 +518,7 @@ if (-not $success) { exit 4 }
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
         .env("EDGE_GHOSTY_POSITION_MS", position_ms.to_string())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("iniciar busca da faixa: {error}"))?;
     if output.status.success() {
@@ -587,7 +591,7 @@ const AUTOSTART_REGISTRY_VALUE: &str = "Edge Ghosty";
 fn is_autostart_enabled() -> Result<bool, String> {
     let output = Command::new("reg.exe")
         .args(["query", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE])
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("não consegui consultar a inicialização do Windows: {error}"))?;
     Ok(output.status.success())
@@ -601,7 +605,7 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
         }
         let output = Command::new("reg.exe")
             .args(["delete", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE, "/f"])
-            .creation_flags(0x08000000)
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|error| format!("não consegui remover a inicialização do Windows: {error}"))?;
         if output.status.success() {
@@ -617,7 +621,7 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
         .args(["add", AUTOSTART_REGISTRY_KEY, "/v", AUTOSTART_REGISTRY_VALUE, "/t", "REG_SZ", "/d"])
         .arg(command_line)
         .args(["/f"])
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("não consegui configurar a inicialização do Windows: {error}"))?;
     if output.status.success() {

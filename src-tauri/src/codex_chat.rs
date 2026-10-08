@@ -6,11 +6,13 @@ use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+use crate::CREATE_NO_WINDOW;
 
 const CHAT_HOME_NAME: &str = "edge-ghosty-chat";
 const MAX_MESSAGE_CHARS: usize = 8_000;
@@ -257,6 +259,7 @@ fn codex_command(home: &Path) -> Result<Command, String> {
         .arg("features.hooks=false")
         .env("CODEX_HOME", home)
         .current_dir(home)
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
