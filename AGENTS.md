@@ -42,7 +42,7 @@ Decisao atual: a navegacao entre abas substitui somente o conteudo do painel, pr
 
 1. Foi pesquisado o repositório Coucou (`https://github.com/louis-cfm/coucou`) para entender o design do notch.
 2. A curva desejada não é uma concavidade para dentro: é uma curva convexa preta nas extremidades, criando a ilusão de que o menu sai da borda.
-3. A hipótese visual adotada foi combinar regiões transparentes com superfícies pretas e `border-radius`/gradientes radiais.
+3. O port Windows do Coucou desenha a ilha como uma superfície preta única com `border-radius` e recorta o conteúdo. O Edge Ghosty segue esse princípio: raio de 14 px recolhido e 22 px expandido, sem pseudo-elementos de orelha com gradiente.
 4. O projeto foi criado inicialmente como um app Tauri/Vite.
 5. O primeiro erro foi `cargo metadata ... program not found`; Rust/Cargo foram instalados.
 6. Depois apareceu `link.exe not found`; foram instalados os Visual Studio 2022 Build Tools com ferramentas C++.
@@ -261,3 +261,7 @@ npm run tauri dev
 74. Em `2026-10-08-edge-ghosty-release-v1-0-0`, as versões do app, npm, Cargo e Tauri ficam alinhadas em `1.0.0`. Depois de verificar que a tag antiga não tinha Release publicado nem execução de Actions, `v1.0.0` foi movida para o commit `fcc8af3` e enviada ao repositório canônico `gusata/Ghosty`. O workflow `Windows release` concluiu com sucesso e deixou o setup NSIS anexado ao rascunho `Edge Ghosty v1.0.0`; revisar e publicar o rascunho manualmente. O `origin` local aponta para `https://github.com/gusata/Ghosty.git`.
 
 75. Em `2026-10-08-edge-ghosty-windows-sem-console`, builds de release do Tauri no Windows usam `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` em `src-tauri/src/main.rs`, para o executável abrir como app GUI sem janela de terminal; builds de desenvolvimento mantêm o console. A versão `1.0.1` corrige a janela de console observada no release público `1.0.0`. A tag `v1.0.1` dispara o workflow e deixa o instalador NSIS em um rascunho de Release para publicação manual.
+
+76. Em `2026-10-08-edge-ghosty-hover-monitores-pet-layout`, a margem de hover de 14 px fica fixa ao redor da barrinha recolhida e continua click-through; o retângulo nativo da superfície expandida acompanha a animação sem ampliar essa margem. Os sliders de tamanho atualizam a geometria publicada sem reposicionar a janela em cada movimento. O seletor de monitor permite somente uma tela, converte preferências antigas de todos os monitores para a principal e não cria janelas `display-*`. A vista Pet usa a mesma altura da Home e Atalhos usa linhas de altura determinada pelo conteúdo.
+
+77. Em `2026-10-08-edge-ghosty-curvatura-coucou-windows`, as curvas da ilha usam `border-radius` no próprio corpo preto, seguindo o CSS do port Windows do Coucou. O corpo é arredondado em 14 px recolhido e 22 px expandido; o `overflow: hidden` do corpo recorta o conteúdo. Os pseudo-elementos com gradientes radiais e o offset JavaScript das orelhas foram removidos.
