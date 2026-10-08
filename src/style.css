@@ -2473,3 +2473,21 @@ footer { justify-content: space-between; margin-top: 18px; color: #575757; font-
   grid-template-rows: minmax(170px, .8fr) minmax(0, 1.2fr);
   gap: 6px;
 }
+
+.app-update-status { display: block; margin-top: 6px; color: #a1a2a6; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.app-update-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.app-update-actions .reset-button { min-height: 32px; flex: 1; margin: 0; }
+.app-update-actions [hidden] { display: none !important; }
+.menu-header .settings-button.has-app-update { position: relative; }
+.menu-header .settings-button.has-app-update::after {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 6px;
+  border: 1px solid #111214;
+  border-radius: 50%;
+  background: #8bdcff;
+  box-shadow: 0 0 8px #62c9ff99;
+  content: "";
+}

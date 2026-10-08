@@ -1084,6 +1084,8 @@ async fn apply_display_layout(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(CursorState::default())
         .manage(codex_chat::CodexChatState::default())
         .manage(github::GithubCache::default())
