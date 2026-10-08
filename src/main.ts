@@ -247,10 +247,11 @@ const MIN_LENGTH = 48;
 const MAX_LENGTH = 240;
 const LENGTH_STEP = 2;
 const MIN_THICKNESS = 6;
-const MAX_THICKNESS = 18;
+const MAX_THICKNESS = 28;
 const MIN_CLOSE_DELAY = 0;
 const MAX_CLOSE_DELAY = 900;
-const EAR_RADIUS = 14;
+const MEDIA_CAPSULE_LENGTH = 96;
+const MEDIA_CAPSULE_THICKNESS = 20;
 const MAX_SAVED_TEXT = 50_000;
 const MAX_CHAT_TEXT_CONTEXT_CHARS = 6_000;
 const LARGE_CHAT_FILE_WARNING_BYTES = 25 * 1024 * 1024;
@@ -402,6 +403,7 @@ let geometryMotion: {
 } | undefined;
 let lastPublishedBody: HTMLElement | undefined;
 let lastPublishedRect: { x: number; y: number; width: number; height: number } | undefined;
+let lastPublishedHoverRect: { x: number; y: number; width: number; height: number } | undefined;
 let rectPublishAttempt = 0;
 let wasPointerInNativeIsland = false;
 
@@ -1117,17 +1119,56 @@ function currentRadius(style: CSSStyleDeclaration) {
     : edge === "bottom"
       ? style.borderTopLeftRadius
       : style.borderTopRightRadius;
-  return Number.parseFloat(value) || 4;
+  return Number.parseFloat(value) || 14;
 }
 
 function setBodyGeometry(body: HTMLElement, width: number, height: number, radius: number) {
   body.style.width = `${width}px`;
   body.style.height = `${height}px`;
   body.style.borderRadius = radiusString(radius);
-  const island = body.closest<HTMLElement>(".edge-island");
-  const earSpan = edge === "left" ? height : width;
-  island?.style.setProperty("--bar-ear-offset", `${earSpan / 2 + EAR_RADIUS}px`);
+  positionCodexMediaBubble(body);
   publishNativeHitBounds(body);
+}
+
+function collapsedIslandSize(island = app.querySelector<HTMLElement>(".edge-island")) {
+  if (island?.classList.contains("is-media-capsule")) {
+    const length = Math.max(barLength, MEDIA_CAPSULE_LENGTH);
+    const thickness = Math.max(barThickness, MEDIA_CAPSULE_THICKNESS);
+    return edge === "left" ? { width: thickness, height: length } : { width: length, height: thickness };
+  }
+  return edge === "left"
+    ? { width: barThickness, height: barLength }
+    : { width: barLength, height: barThickness };
+}
+
+function shouldShowCollapsedMediaCapsule(island = app.querySelector<HTMLElement>(".edge-island")) {
+  return mediaInfo.playing
+    && Boolean(mediaInfo.artworkDataUrl)
+    && pendingCodexApprovals.length === 0
+    && !island?.classList.contains("is-task-complete");
+}
+
+function syncCollapsedMediaCapsule(island = app.querySelector<HTMLElement>(".edge-island")) {
+  if (!island) return;
+  const wasActive = island.classList.contains("is-media-capsule");
+  const isActive = shouldShowCollapsedMediaCapsule(island);
+  island.classList.toggle("is-media-capsule", isActive);
+  if (!expanded && wasActive !== isActive) animateIsland(false);
+}
+
+function positionCodexMediaBubble(body = app.querySelector<HTMLElement>(".island-body")) {
+  const island = body?.closest<HTMLElement>(".edge-island");
+  const bubble = island?.querySelector<HTMLElement>(".codex-media-bubble");
+  if (!body || !bubble) return;
+  const rect = body.getBoundingClientRect();
+  bubble.style.left = `${rect.right + 7}px`;
+  bubble.style.top = `${rect.top + rect.height / 2}px`;
+}
+
+function syncCodexMediaBubble(island = app.querySelector<HTMLElement>(".edge-island")) {
+  if (!island) return;
+  island.classList.toggle("is-codex-media-active", codexTaskRunning && mediaInfo.playing);
+  positionCodexMediaBubble(island.querySelector<HTMLElement>(".island-body") ?? undefined);
 }
 
 function publishNativeHitBounds(body: HTMLElement) {
@@ -1141,20 +1182,38 @@ function publishNativeHitBounds(body: HTMLElement) {
   const top = Math.min(...rects.map((rect) => rect.top));
   const right = Math.max(...rects.map((rect) => rect.right));
   const bottom = Math.max(...rects.map((rect) => rect.bottom));
+  const hostWidth = window.innerWidth;
+  const hostHeight = window.innerHeight;
+  const hover = edge === "left"
+    ? { x: 0, y: (hostHeight - barLength) / 2, width: barThickness, height: barLength }
+    : {
+      x: (hostWidth - barLength) / 2,
+      y: edge === "top" ? 0 : hostHeight - barThickness,
+      width: barLength,
+      height: barThickness,
+    };
   if (lastPublishedBody !== body) {
     lastPublishedBody = body;
     lastPublishedRect = undefined;
+    lastPublishedHoverRect = undefined;
   }
   const next = { x: left, y: top, width: right - left, height: bottom - top };
   if (lastPublishedRect && Math.abs(next.x - lastPublishedRect.x) < 0.5
     && Math.abs(next.y - lastPublishedRect.y) < 0.5
     && Math.abs(next.width - lastPublishedRect.width) < 0.5
-    && Math.abs(next.height - lastPublishedRect.height) < 0.5) return;
+    && Math.abs(next.height - lastPublishedRect.height) < 0.5
+    && lastPublishedHoverRect
+    && Math.abs(hover.x - lastPublishedHoverRect.x) < 0.5
+    && Math.abs(hover.y - lastPublishedHoverRect.y) < 0.5
+    && Math.abs(hover.width - lastPublishedHoverRect.width) < 0.5
+    && Math.abs(hover.height - lastPublishedHoverRect.height) < 0.5) return;
   lastPublishedRect = next;
+  lastPublishedHoverRect = hover;
   const attempt = ++rectPublishAttempt;
-  void invoke("set_island_rect", next).catch(() => {
+  void invoke("set_island_rect", { ...next, hoverX: hover.x, hoverY: hover.y, hoverWidth: hover.width, hoverHeight: hover.height }).catch(() => {
     if (attempt !== rectPublishAttempt || lastPublishedBody !== body || !body.isConnected) return;
     lastPublishedRect = undefined;
+    lastPublishedHoverRect = undefined;
     window.setTimeout(() => {
       if (lastPublishedBody === body && body.isConnected) publishNativeHitBounds(body);
     }, 100);
@@ -1212,7 +1271,7 @@ function expandedIslandSize() {
   const preferredHeight = settingsOpen || onboardingOpen
     ? horizontal ? 380 : 620
     : activeTab === "home" ? horizontal ? 210 : 480
-      : activeTab === "pet" ? horizontal ? 330 : 620
+      : activeTab === "pet" ? horizontal ? 210 : 480
         : horizontal ? 380 : 620;
   return {
     width: Math.min(preferredWidth, Math.max(220, window.innerWidth - (horizontal ? 40 : 32))),
@@ -1234,10 +1293,11 @@ function animateIsland(open: boolean) {
     radius: new Tracked(currentRadius(style)),
   };
   const expandedSize = expandedIslandSize();
+  const collapsedSize = collapsedIslandSize();
   const target = {
-    width: open ? expandedSize.width : edge === "left" ? barThickness : barLength,
-    height: open ? expandedSize.height : edge === "left" ? barLength : barThickness,
-    radius: open ? 22 : 4,
+    width: open ? expandedSize.width : collapsedSize.width,
+    height: open ? expandedSize.height : collapsedSize.height,
+    radius: open ? 22 : 14,
   };
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const token = ++geometryFrame;
@@ -1282,10 +1342,9 @@ function escapeHtml(value: string) {
 }
 
 function getSelectedDisplayIds() {
-  if (allDisplays) return displays.map((display) => display.id);
   const availableIds = new Set(displays.map((display) => display.id));
-  const filtered = selectedDisplayIds.filter((id) => availableIds.has(id));
-  if (filtered.length > 0) return filtered;
+  const selected = selectedDisplayIds.find((id) => availableIds.has(id));
+  if (selected) return [selected];
   return displays.find((display) => display.isPrimary)?.id
     ? [displays.find((display) => display.isPrimary)!.id]
     : displays.slice(0, 1).map((display) => display.id);
@@ -1297,7 +1356,7 @@ function persistSettings() {
   localStorage.setItem(KEYS.edge, edge);
   localStorage.setItem(KEYS.closeDelay, String(closeDelay));
   localStorage.setItem(KEYS.displays, JSON.stringify(selectedDisplayIds));
-  localStorage.setItem(KEYS.allDisplays, String(allDisplays));
+  localStorage.setItem(KEYS.allDisplays, "false");
 }
 
 function applyIslandVariables(island: HTMLElement) {
@@ -1308,10 +1367,6 @@ function applyIslandVariables(island: HTMLElement) {
   const expandedSize = expandedIslandSize();
   island.style.setProperty("--expanded-width", `${expandedSize.width}px`);
   island.style.setProperty("--expanded-height", `${expandedSize.height}px`);
-  const body = island.querySelector<HTMLElement>(".island-body");
-  const bodyRect = body?.getBoundingClientRect();
-  const earSpan = edge === "left" ? bodyRect?.height : bodyRect?.width;
-  island.style.setProperty("--bar-ear-offset", `${(earSpan || barLength) / 2 + EAR_RADIUS}px`);
 }
 
 function applyDisplayLayout(isExpanded = expanded) {
@@ -1322,10 +1377,17 @@ function applyDisplayLayout(isExpanded = expanded) {
     barLength,
     barThickness,
     displayIds: ids,
-    selectedDisplayIds,
-    allDisplays,
+    selectedDisplayIds: ids,
+    allDisplays: false,
     closeDelay,
     expanded: isExpanded,
+  }).then(() => {
+    const body = app.querySelector<HTMLElement>(".island-body");
+    if (body) {
+      lastPublishedRect = undefined;
+      lastPublishedHoverRect = undefined;
+      publishNativeHitBounds(body);
+    }
   }).catch(() => undefined);
 }
 
@@ -2860,6 +2922,8 @@ function setCodexTaskRunning(running: boolean) {
   island?.classList.toggle("is-task-running", running);
   app.querySelectorAll<HTMLElement>(".codex-live-indicator").forEach((indicator) => indicator.classList.toggle("is-active", running));
   if (running) island?.classList.remove("is-task-complete");
+  syncCollapsedMediaCapsule(island);
+  syncCodexMediaBubble(island);
   island?.querySelector(".peek-line")?.setAttribute(
     "aria-label",
     running ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty",
@@ -2885,6 +2949,7 @@ function updateCodexApprovalPresentation() {
 
   island.classList.toggle("is-approval-pending", Boolean(approval));
   island.classList.toggle("is-approval-inline", inlineVisible);
+  syncCollapsedMediaCapsule(island);
   toast?.setAttribute("aria-hidden", String(!externalVisible));
   inline?.setAttribute("aria-hidden", String(!inlineVisible));
 
@@ -2952,11 +3017,12 @@ function updateCodexApprovalPresentation() {
   refreshHomeStatusUi();
 }
 
-function clearTaskCompletionToast(island = app.querySelector<HTMLElement>(".edge-island")) {
+function clearTaskCompletionToast(island = app.querySelector<HTMLElement>(".edge-island"), syncMediaCapsule = true) {
   if (taskCompletionTimer !== undefined) window.clearTimeout(taskCompletionTimer);
   taskCompletionTimer = undefined;
   island?.classList.remove("is-task-complete");
   island?.querySelector("#ghosty-completion-live")?.replaceChildren();
+  if (syncMediaCapsule) syncCollapsedMediaCapsule(island);
 }
 
 function expireCodexApproval(requestId: string) {
@@ -3031,15 +3097,17 @@ function showGhostyTaskCompletion(message: string) {
   const liveRegion = island?.querySelector<HTMLElement>("#ghosty-completion-live");
   if (!island || !toast || !copy || !liveRegion || expanded || pendingCodexApprovals.length > 0) return;
 
-  clearTaskCompletionToast(island);
+  clearTaskCompletionToast(island, false);
   updateCodexApprovalPresentation();
   copy.textContent = message;
   liveRegion.textContent = message;
   toast.setAttribute("aria-hidden", "false");
   void island.offsetWidth;
   island.classList.add("is-task-complete");
+  syncCollapsedMediaCapsule(island);
   taskCompletionTimer = window.setTimeout(() => {
     island.classList.remove("is-task-complete");
+    syncCollapsedMediaCapsule(island);
     toast.setAttribute("aria-hidden", "true");
     liveRegion.textContent = "";
     taskCompletionTimer = undefined;
@@ -3491,6 +3559,14 @@ function currentMediaPosition() {
   return mediaInfo.durationMs > 0 ? Math.min(position, mediaInfo.durationMs) : position;
 }
 
+function paintCollapsedMediaProgress() {
+  const miniProgress = app.querySelector<HTMLElement>(".media-peek-progress");
+  if (!miniProgress) return;
+  const duration = Math.max(0, mediaInfo.durationMs);
+  const ratio = duration > 0 ? Math.min(1, currentMediaPosition() / duration) : 0;
+  miniProgress.style.setProperty("--media-progress", `${ratio * 100}%`);
+}
+
 function paintMediaInfo() {
   app.querySelectorAll<HTMLElement>(".media-title").forEach((element) => { element.textContent = mediaInfo.title || "Nada tocando agora"; });
   app.querySelectorAll<HTMLElement>(".media-artist").forEach((element) => { element.textContent = mediaInfo.artist || "Quando algo tocar, aparece aqui"; });
@@ -3518,8 +3594,12 @@ function paintMediaInfo() {
     if (mediaInfo.artworkDataUrl) mediaPeekImage.setAttribute("src", mediaInfo.artworkDataUrl);
     else mediaPeekImage.removeAttribute("src");
   }
+  paintCollapsedMediaProgress();
   const hasPlayingArtwork = mediaInfo.playing && Boolean(mediaInfo.artworkDataUrl);
-  app.querySelector<HTMLElement>(".edge-island")?.classList.toggle("is-media-playing", hasPlayingArtwork);
+  const island = app.querySelector<HTMLElement>(".edge-island");
+  island?.classList.toggle("is-media-playing", hasPlayingArtwork);
+  syncCollapsedMediaCapsule(island);
+  syncCodexMediaBubble(island);
 }
 
 function bindAudioMixerInputs(root: ParentNode) {
@@ -4025,9 +4105,10 @@ function updateActiveHomeView(view: HomeView) {
 
 function renderDisplayOptions() {
   if (displays.length === 0) return '<p class="settings-note">Nenhum monitor foi encontrado.</p>';
+  const selectedId = getSelectedDisplayIds()[0];
   return displays.map((display) => `
     <label class="display-option">
-      <input type="checkbox" data-display-id="${escapeHtml(display.id)}" ${allDisplays || selectedDisplayIds.includes(display.id) ? "checked" : ""} ${allDisplays ? "disabled" : ""} />
+      <input type="radio" name="selected-display" data-display-id="${escapeHtml(display.id)}" ${selectedId === display.id ? "checked" : ""} />
       <span><strong>${escapeHtml(display.name)}${display.isPrimary ? " · principal" : ""}</strong><small>${display.width} × ${display.height}</small></span>
     </label>`).join("");
 }
@@ -4043,7 +4124,7 @@ function renderSettingsContent() {
       </header>
       <div class="settings-scroll">
         <section class="settings-context-card">
-        <p class="settings-intro">Ajuste a barrinha e escolha as telas onde o Edge Ghosty aparece.</p>
+        <p class="settings-intro">Ajuste a barrinha e escolha a tela onde o Edge Ghosty aparece.</p>
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-length">${lengthLabel}</label><output id="bar-length-value">${barLength} px</output></div>
           <input id="bar-length" type="range" min="${MIN_LENGTH}" max="${MAX_LENGTH}" step="${LENGTH_STEP}" value="${barLength}" />
@@ -4063,11 +4144,8 @@ function renderSettingsContent() {
           </select>
         </section>
         <section class="control-card setting-card displays-card">
-          <div class="setting-heading">Monitores</div>
-          <label class="display-option all-displays-option">
-            <input id="all-displays" type="checkbox" ${allDisplays ? "checked" : ""} />
-            <span><strong>Todos os monitores</strong><small>Mostrar em cada tela conectada</small></span>
-          </label>
+          <div class="setting-heading">Monitor</div>
+          <small class="settings-note">Escolha uma tela para mostrar o Ghosty.</small>
           <div class="display-list">${renderDisplayOptions()}</div>
         </section>
         <section class="control-card setting-card">
@@ -4165,7 +4243,8 @@ function scheduleClose() {
   hoverCloseTimer = window.setTimeout(() => {
     hoverCloseTimer = undefined;
     const body = app.querySelector<HTMLElement>(".island-body");
-    if (expanded && body?.matches(":hover")) return;
+    // DOM leave can arrive before the native cursor poll reports that the pointer exited.
+    if (expanded && (body?.matches(":hover") || wasPointerInNativeIsland)) return;
     setExpanded(false);
   }, closeDelay);
 }
@@ -4175,7 +4254,6 @@ function bindRange(
   update: (value: number) => void,
   outputSelector: string,
   format: (value: number) => string,
-  layout = true,
 ) {
   app.querySelector<HTMLInputElement>(selector)?.addEventListener("input", (event) => {
     const value = Number((event.target as HTMLInputElement).value);
@@ -4183,9 +4261,12 @@ function bindRange(
     const output = app.querySelector<HTMLOutputElement>(outputSelector);
     if (output) output.value = format(value);
     const island = app.querySelector<HTMLElement>(".edge-island");
-    if (island) applyIslandVariables(island);
+    if (island) {
+      applyIslandVariables(island);
+      const body = island.querySelector<HTMLElement>(".island-body");
+      if (body) publishNativeHitBounds(body);
+    }
     persistSettings();
-    if (layout) void applyDisplayLayout();
   });
 }
 
@@ -4252,20 +4333,10 @@ function bindSettings() {
     render();
     void applyDisplayLayout();
   });
-  app.querySelector<HTMLInputElement>("#all-displays")?.addEventListener("change", (event) => {
-    allDisplays = (event.target as HTMLInputElement).checked;
-    persistSettings();
-    render();
-    void applyDisplayLayout();
-  });
   app.querySelectorAll<HTMLInputElement>("[data-display-id]").forEach((input) => {
     input.addEventListener("change", () => {
       const id = input.dataset.displayId!;
-      const next = new Set(selectedDisplayIds);
-      if (input.checked) next.add(id);
-      else next.delete(id);
-      if (next.size === 0) return;
-      selectedDisplayIds = [...next];
+      selectedDisplayIds = [id];
       allDisplays = false;
       persistSettings();
       render();
@@ -4290,7 +4361,9 @@ function bindCodexApprovalButtons(container: ParentNode) {
 function render() {
   const previousIsland = app.querySelector<HTMLElement>(".edge-island");
   const previousBody = previousIsland?.querySelector<HTMLElement>(".island-body");
-  const previousGeometry = expanded && previousBody && previousIsland?.dataset.edge === edge
+  const previousGeometry = previousBody
+    && previousIsland?.dataset.edge === edge
+    && (expanded || previousIsland.classList.contains("is-media-capsule"))
     ? {
       width: previousBody.getBoundingClientRect().width,
       height: previousBody.getBoundingClientRect().height,
@@ -4298,9 +4371,11 @@ function render() {
     }
     : null;
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${shouldShowCollapsedMediaCapsule(previousIsland) ? "is-media-capsule" : ""} ${codexTaskRunning && mediaInfo.playing ? "is-codex-media-active" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
         <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
+        <div class="media-peek" aria-hidden="true"><img alt="" draggable="false"${mediaInfo.artworkDataUrl ? ` src="${escapeHtml(mediaInfo.artworkDataUrl)}"` : ""}></div>
+        <div class="media-peek-progress" aria-hidden="true" style="--media-progress:${mediaInfo.durationMs > 0 ? Math.min(1, currentMediaPosition() / mediaInfo.durationMs) * 100 : 0}%"><span></span></div>
         <div class="island-content">
           <header class="menu-header">
             ${onboardingOpen ? '<div class="onboarding-brand">EDGE GHOSTY</div>' : `<nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
@@ -4330,7 +4405,6 @@ function render() {
           </div>
         </div>
       </div>
-      <div class="media-peek" aria-hidden="true"><img alt="" draggable="false"${mediaInfo.artworkDataUrl ? ` src="${escapeHtml(mediaInfo.artworkDataUrl)}"` : ""}></div>
       <div class="ghosty-completion" aria-hidden="true">
         <div class="pet ghosty-completion-pet" data-skin="${petSkin}" data-accessory="${petAccessory}" data-mood="happy" aria-hidden="true">
           <canvas class="pet-canvas" aria-hidden="true"></canvas>
@@ -4347,6 +4421,7 @@ function render() {
           <p class="ghosty-approval-error" role="status" hidden></p>
         </div>
       </div>
+      <div class="codex-media-bubble" aria-hidden="true"><span></span></div>
       <span class="task-completion-live" id="ghosty-completion-live" role="status" aria-live="polite"></span>
     </section>`;
 
@@ -4362,6 +4437,11 @@ function render() {
 
   const body = island.querySelector<HTMLElement>(".island-body")!;
   if (previousGeometry) setBodyGeometry(body, previousGeometry.width, previousGeometry.height, previousGeometry.radius);
+  else if (!expanded && island.classList.contains("is-media-capsule")) {
+    const collapsedSize = collapsedIslandSize(island);
+    setBodyGeometry(body, collapsedSize.width, collapsedSize.height, 14);
+  }
+  syncCodexMediaBubble(island);
   publishNativeHitBounds(body);
   body.addEventListener("pointerenter", () => {
     if (hoverCloseTimer !== undefined) {
@@ -4469,6 +4549,7 @@ async function startMainWindow() {
       nextMediaRefreshAt = now + (mediaViewOpen ? 1500 : 4000);
       void refreshMediaInfo();
     }
+    paintCollapsedMediaProgress();
     if (!mediaViewOpen) return;
     paintMediaInfo();
     if (volumeMixerOpen && now >= nextMixerRefreshAt) {
@@ -4488,16 +4569,15 @@ async function startMainWindow() {
   void refreshMediaInfo();
   try {
     displays = await invoke<DisplayInfo[]>("list_displays");
-    if (localStorage.getItem(KEYS.displays) === null) {
+    if (allDisplays || localStorage.getItem(KEYS.displays) === null) {
       const primary = displays.find((display) => display.isPrimary) ?? displays[0];
       selectedDisplayIds = primary ? [primary.id] : [];
     } else {
-      selectedDisplayIds = selectedDisplayIds.filter((id) => displays.some((display) => display.id === id));
-    }
-    if (selectedDisplayIds.length === 0 && displays.length > 0) {
+      const selected = selectedDisplayIds.find((id) => displays.some((display) => display.id === id));
       const primary = displays.find((display) => display.isPrimary) ?? displays[0];
-      selectedDisplayIds = [primary.id];
+      selectedDisplayIds = selected ? [selected] : primary ? [primary.id] : [];
     }
+    allDisplays = false;
     persistSettings();
     render();
     await applyDisplayLayout(expanded);
@@ -4512,8 +4592,8 @@ void listen<LayoutUpdate>("edge-ghosty-layout-updated", ({ payload }) => {
   barLength = payload.barLength;
   barThickness = payload.barThickness;
   closeDelay = payload.closeDelay;
-  allDisplays = payload.allDisplays;
-  selectedDisplayIds = payload.selectedDisplayIds;
+  allDisplays = false;
+  selectedDisplayIds = payload.selectedDisplayIds.slice(0, 1);
   expanded = false;
   persistSettings();
   render();

@@ -7,10 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::window::Monitor;
-use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
-};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use windows::Win32::Foundation::{CloseHandle, GlobalFree, HANDLE, HGLOBAL, POINT};
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
@@ -134,6 +131,7 @@ struct PocketFileMetadata {
 #[derive(Default)]
 struct CursorState {
     rects: Arc<Mutex<HashMap<String, IslandRect>>>,
+    hover_rects: Arc<Mutex<HashMap<String, IslandRect>>>,
     ignoring: Arc<Mutex<HashMap<String, bool>>>,
 }
 
@@ -681,17 +679,34 @@ fn set_island_rect(
     y: f64,
     width: f64,
     height: f64,
+    hover_x: f64,
+    hover_y: f64,
+    hover_width: f64,
+    hover_height: f64,
 ) -> Result<(), String> {
-    if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
+    if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite()
+        || !hover_x.is_finite() || !hover_y.is_finite()
+        || !hover_width.is_finite() || !hover_height.is_finite()
+    {
         return Err("geometria do notch inválida".to_string());
     }
+    let label = window.label().to_string();
     state.rects.lock().unwrap().insert(
-        window.label().to_string(),
+        label.clone(),
         IslandRect {
             x,
             y,
             width,
             height,
+        },
+    );
+    state.hover_rects.lock().unwrap().insert(
+        label,
+        IslandRect {
+            x: hover_x,
+            y: hover_y,
+            width: hover_width,
+            height: hover_height,
         },
     );
     Ok(())
@@ -700,6 +715,7 @@ fn set_island_rect(
 fn spawn_cursor_poll(
     app: AppHandle,
     rects: Arc<Mutex<HashMap<String, IslandRect>>>,
+    hover_rects: Arc<Mutex<HashMap<String, IslandRect>>>,
     ignoring: Arc<Mutex<HashMap<String, bool>>>,
 ) {
     thread::spawn(move || {
@@ -722,6 +738,7 @@ fn spawn_cursor_poll(
                     continue;
                 }
                 let rect = rects.lock().unwrap().get(&label).copied();
+                let hover_rect = hover_rects.lock().unwrap().get(&label).copied();
                 let Some(rect) = rect else {
                     if ignoring.lock().unwrap().get(&label).copied() != Some(true)
                         && window.set_ignore_cursor_events(true).is_ok()
@@ -740,14 +757,20 @@ fn spawn_cursor_poll(
                 let x = (cursor.x - origin.x) as f64 / scale;
                 let y = (cursor.y - origin.y) as f64 / scale;
                 let dragging = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
-                let margin = if dragging { 0.0 } else { CURSOR_HIT_MARGIN };
-                // While dragging, activate only over the currently visible island; its published rect grows with the opening animation.
-                let inside = x >= rect.x - margin
-                    && x <= rect.x + rect.width + margin
-                    && y >= rect.y - margin
-                    && y <= rect.y + rect.height + margin;
+                let inside_body = x >= rect.x
+                    && x <= rect.x + rect.width
+                    && y >= rect.y
+                    && y <= rect.y + rect.height;
+                let inside_collapsed_hover = !dragging && hover_rect.is_some_and(|hover| {
+                    x >= hover.x - CURSOR_HIT_MARGIN
+                        && x <= hover.x + hover.width + CURSOR_HIT_MARGIN
+                        && y >= hover.y - CURSOR_HIT_MARGIN
+                        && y <= hover.y + hover.height + CURSOR_HIT_MARGIN
+                });
+                let inside = inside_body || inside_collapsed_hover;
                 let position = CursorPosition { x, y, inside, dragging };
-                let ignore = !inside;
+                // The hover margin can open the menu but remains click-through.
+                let ignore = !inside_body;
                 if ignoring.lock().unwrap().get(&label).copied() != Some(ignore)
                     && window.set_ignore_cursor_events(ignore).is_ok()
                 {
@@ -960,38 +983,6 @@ fn place_utility_popup(
     popup.set_focus().map_err(|error| error.to_string())
 }
 
-fn ensure_display_windows(app: &AppHandle, count: usize) -> Result<(), String> {
-    for index in 1..count {
-        let label = format!("display-{index}");
-        if app.get_webview_window(&label).is_some() {
-            continue;
-        }
-        WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
-            .title("Edge Ghosty")
-            .inner_size(900.0, 720.0)
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .resizable(false)
-            .focused(false)
-            .visible(false)
-            .build()
-            .map_err(|error| error.to_string())?;
-        let window = app
-            .get_webview_window(&format!("display-{index}"))
-            .ok_or_else(|| "janela do monitor não encontrada".to_string())?;
-        window
-            .set_ignore_cursor_events(true)
-            .map_err(|error| error.to_string())?;
-        window
-            .set_always_on_top(true)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
 #[tauri::command]
 async fn apply_display_layout(
     app: AppHandle,
@@ -1007,14 +998,17 @@ async fn apply_display_layout(
     expanded: bool,
 ) -> Result<(), String> {
     let edge = Edge::parse(&edge)?;
+    let _legacy_all_displays = all_displays;
     let monitors = app
         .available_monitors()
         .map_err(|error| error.to_string())?;
-    ensure_display_windows(&app, monitors.len())?;
     let primary = app.primary_monitor().map_err(|error| error.to_string())?;
     let mut selected: Vec<_> = monitors
         .iter()
-        .filter(|monitor| display_ids.contains(&display_id(monitor)))
+        .filter(|monitor| {
+            display_ids.contains(&display_id(monitor))
+                || (display_ids.is_empty() && selected_display_ids.contains(&display_id(monitor)))
+        })
         .collect();
     selected.sort_by_key(|monitor| !is_primary_monitor(monitor, primary.as_ref()));
     if selected.is_empty() {
@@ -1026,6 +1020,10 @@ async fn apply_display_layout(
     if selected.is_empty() {
         return Err("nenhum monitor disponível".to_string());
     }
+
+    selected.truncate(1);
+    let selected_display_ids = vec![display_id(selected[0])];
+    let display_ids = selected_display_ids.clone();
 
     let mut windows: Vec<_> = app
         .webview_windows()
@@ -1051,13 +1049,14 @@ async fn apply_display_layout(
             target_window
                 .set_always_on_top(true)
                 .map_err(|error| error.to_string())?;
-            state.rects.lock().unwrap().insert(
-                target_window.label().to_string(),
-                collapsed_island_rect(edge, bar_length, bar_thickness, monitor),
-            );
+            let label = target_window.label().to_string();
+            let collapsed = collapsed_island_rect(edge, bar_length, bar_thickness, monitor);
+            state.rects.lock().unwrap().insert(label.clone(), collapsed);
+            state.hover_rects.lock().unwrap().insert(label, collapsed);
         } else {
             target_window.hide().map_err(|error| error.to_string())?;
             state.rects.lock().unwrap().remove(target_window.label());
+            state.hover_rects.lock().unwrap().remove(target_window.label());
         }
     }
     app.emit(
@@ -1072,7 +1071,7 @@ async fn apply_display_layout(
             bar_length,
             bar_thickness,
             close_delay,
-            all_displays,
+            all_displays: false,
             selected_display_ids,
             display_ids,
             active_label,
@@ -1097,6 +1096,7 @@ pub fn run() {
             spawn_cursor_poll(
                 app.handle().clone(),
                 cursor_state.rects.clone(),
+                cursor_state.hover_rects.clone(),
                 cursor_state.ignoring.clone(),
             );
             if let Some(window) = app.get_webview_window("main") {
