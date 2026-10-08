@@ -64,6 +64,7 @@ struct LayoutUpdate {
     edge: String,
     bar_length: u32,
     bar_thickness: u32,
+    position_percent: f64,
     close_delay: u32,
     all_displays: bool,
     selected_display_ids: Vec<String>,
@@ -803,7 +804,7 @@ fn spawn_cursor_poll(
     });
 }
 
-fn window_geometry(edge: Edge, monitor: &Monitor) -> (PhysicalSize<u32>, PhysicalPosition<i32>) {
+fn window_geometry(edge: Edge, monitor: &Monitor, position_percent: f64) -> (PhysicalSize<u32>, PhysicalPosition<i32>) {
     let scale = monitor.scale_factor();
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
@@ -823,7 +824,8 @@ fn window_geometry(edge: Edge, monitor: &Monitor) -> (PhysicalSize<u32>, Physica
     );
     let remaining_x = monitor_size.width.saturating_sub(size.width);
     let remaining_y = monitor_size.height.saturating_sub(size.height);
-    let along = |remaining: u32| remaining / 2;
+    let position = position_percent.clamp(0.0, 100.0) / 100.0;
+    let along = |remaining: u32| (f64::from(remaining) * position).round() as u32;
     let x = match edge {
         Edge::Left => monitor_position.x,
         Edge::Top | Edge::Bottom => monitor_position.x + along(remaining_x) as i32,
@@ -840,30 +842,32 @@ fn collapsed_island_rect(
     edge: Edge,
     bar_length: u32,
     bar_thickness: u32,
+    position_percent: f64,
     monitor: &Monitor,
 ) -> IslandRect {
     let scale = monitor.scale_factor();
-    let (host_size, _) = window_geometry(edge, monitor);
+    let (host_size, _) = window_geometry(edge, monitor, position_percent);
     let host_width = f64::from(host_size.width) / scale;
     let host_height = f64::from(host_size.height) / scale;
     let length = f64::from(bar_length);
     let thickness = f64::from(bar_thickness);
+    let position = position_percent.clamp(0.0, 100.0) / 100.0;
 
     match edge {
         Edge::Left => IslandRect {
             x: 0.0,
-            y: (host_height - length) / 2.0,
+            y: (host_height - length).max(0.0) * position,
             width: thickness,
             height: length,
         },
         Edge::Top => IslandRect {
-            x: (host_width - length) / 2.0,
+            x: (host_width - length).max(0.0) * position,
             y: 0.0,
             width: length,
             height: thickness,
         },
         Edge::Bottom => IslandRect {
-            x: (host_width - length) / 2.0,
+            x: (host_width - length).max(0.0) * position,
             y: host_height - thickness,
             width: length,
             height: thickness,
@@ -871,8 +875,8 @@ fn collapsed_island_rect(
     }
 }
 
-fn place_window(window: &WebviewWindow, edge: Edge, monitor: &Monitor) -> Result<(), String> {
-    let (size, location) = window_geometry(edge, monitor);
+fn place_window(window: &WebviewWindow, edge: Edge, monitor: &Monitor, position_percent: f64) -> Result<(), String> {
+    let (size, location) = window_geometry(edge, monitor, position_percent);
     let handle = window.hwnd().map_err(|error| error.to_string())?;
     unsafe {
         SetWindowPos(
@@ -886,9 +890,6 @@ fn place_window(window: &WebviewWindow, edge: Edge, monitor: &Monitor) -> Result
         )
         .map_err(|error| error.to_string())?;
     }
-    window
-        .set_skip_taskbar(true)
-        .map_err(|error| error.to_string())?;
     window
         .set_always_on_top(true)
         .map_err(|error| error.to_string())
@@ -907,6 +908,27 @@ fn show_utility_popup(
 #[tauri::command]
 fn show_quick_chat(app: AppHandle, window: WebviewWindow) -> Result<(), String> {
     place_utility_popup(&app, &window, None, true)
+}
+
+#[tauri::command]
+fn show_settings_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("settings-window")
+        .ok_or_else(|| "janela de configurações não encontrada".to_string())?;
+    window.center().map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_onboarding(app: AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "janela principal não encontrada".to_string())?;
+    main.show().map_err(|error| error.to_string())?;
+    main.set_focus().map_err(|error| error.to_string())?;
+    app.emit_to("main", "edge-ghosty-open-onboarding", ())
+        .map_err(|error| error.to_string())
 }
 
 fn place_utility_popup(
@@ -940,10 +962,6 @@ fn place_utility_popup(
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let scale = monitor.scale_factor();
-    popup
-        .set_skip_taskbar(true)
-        .map_err(|error| error.to_string())?;
-
     let logical_width = if quick_chat {
         (f64::from(monitor_size.width) / scale - 32.0).clamp(320.0, 560.0)
     } else {
@@ -991,6 +1009,9 @@ fn place_utility_popup(
         .set_always_on_top(true)
         .map_err(|error| error.to_string())?;
     popup.show().map_err(|error| error.to_string())?;
+    popup
+        .set_skip_taskbar(true)
+        .map_err(|error| error.to_string())?;
     popup.set_focus().map_err(|error| error.to_string())
 }
 
@@ -1006,6 +1027,7 @@ async fn apply_display_layout(
     selected_display_ids: Vec<String>,
     all_displays: bool,
     close_delay: u32,
+    position_percent: f64,
     expanded: bool,
 ) -> Result<(), String> {
     let edge = Edge::parse(&edge)?;
@@ -1055,13 +1077,16 @@ async fn apply_display_layout(
     let active_label = window.label().to_string();
     for (index, (_, target_window)) in windows.iter().enumerate() {
         if let Some(monitor) = selected.get(index) {
-            place_window(target_window, edge, monitor)?;
+            place_window(target_window, edge, monitor, position_percent)?;
             target_window.show().map_err(|error| error.to_string())?;
+            target_window
+                .set_skip_taskbar(true)
+                .map_err(|error| error.to_string())?;
             target_window
                 .set_always_on_top(true)
                 .map_err(|error| error.to_string())?;
             let label = target_window.label().to_string();
-            let collapsed = collapsed_island_rect(edge, bar_length, bar_thickness, monitor);
+            let collapsed = collapsed_island_rect(edge, bar_length, bar_thickness, position_percent, monitor);
             state.rects.lock().unwrap().insert(label.clone(), collapsed);
             state.hover_rects.lock().unwrap().insert(label, collapsed);
         } else {
@@ -1081,6 +1106,7 @@ async fn apply_display_layout(
             .to_string(),
             bar_length,
             bar_thickness,
+            position_percent: position_percent.clamp(0.0, 100.0),
             close_delay,
             all_displays: false,
             selected_display_ids,
@@ -1113,12 +1139,12 @@ pub fn run() {
                 cursor_state.ignoring.clone(),
             );
             if let Some(window) = app.get_webview_window("main") {
-                window.set_skip_taskbar(true)?;
                 if let Some(monitor) = window.primary_monitor()? {
                     window.set_ignore_cursor_events(true)?;
                     window.set_always_on_top(true)?;
-                    place_window(&window, Edge::Left, &monitor).map_err(std::io::Error::other)?;
+                    place_window(&window, Edge::Left, &monitor, 50.0).map_err(std::io::Error::other)?;
                 }
+                window.set_skip_taskbar(true)?;
             }
             Ok(())
         })
@@ -1153,6 +1179,8 @@ pub fn run() {
             apply_display_layout,
             show_utility_popup,
             show_quick_chat,
+            show_settings_window,
+            open_onboarding,
             codex_chat::quick_chat_start,
             codex_chat::quick_chat_status,
             codex_chat::quick_chat_login,

@@ -28,7 +28,9 @@ type MediaInfo = {
 };
 type AudioAppVolume = { processId: number; name: string; volume: number };
 type Edge = "left" | "top" | "bottom";
-type MenuTab = "home" | "pet" | "shortcuts";
+type MenuTab = "home" | "pet";
+type SettingsTab = "general" | "shortcuts";
+type InteractionMode = "hover" | "click";
 type HomeView = "now" | "activity" | "github" | "vercel" | "media";
 type UtilityPopupMode = "focus" | "focus-summary" | "codex-activity" | "pocket" | "customize" | "clipboard" | "chat";
 type UtilityPopupPosition = { x: number; y: number };
@@ -51,6 +53,7 @@ type LayoutUpdate = {
   edge: Edge;
   barLength: number;
   barThickness: number;
+  positionPercent: number;
   closeDelay: number;
   allDisplays: boolean;
   selectedDisplayIds: string[];
@@ -95,6 +98,9 @@ const LAUNCHER_DEFAULTS: Shortcut[] = [
 const KEYS = {
   length: "edge-ghosty.bar-height",
   thickness: "edge-ghosty.bar-width",
+  barPosition: "edge-ghosty.bar-position",
+  interactionMode: "edge-ghosty.interaction-mode",
+  settingsTab: "edge-ghosty.settings-tab",
   edge: "edge-ghosty.edge",
   closeDelay: "edge-ghosty.close-delay",
   displays: "edge-ghosty.display-ids",
@@ -123,6 +129,9 @@ const KEYS = {
 const LEGACY_KEYS = {
   length: "edge-mochi.bar-height",
   thickness: "edge-mochi.bar-width",
+  barPosition: "edge-mochi.bar-position",
+  interactionMode: "edge-mochi.interaction-mode",
+  settingsTab: "edge-mochi.settings-tab",
   edge: "edge-mochi.edge",
   closeDelay: "edge-mochi.close-delay",
   displays: "edge-mochi.display-ids",
@@ -165,6 +174,7 @@ if (localStorage.getItem(KEYS.onboardingComplete) === null
 const currentWindowLabel = getCurrentWindow().label;
 let onboardingOpen = currentWindowLabel === "main" && localStorage.getItem(KEYS.onboardingComplete) !== "true";
 let onboardingStep: "welcome" | "choices" = "welcome";
+let onboardingIntroStarted = false;
 const QUICK_CHAT_SITE_CACHE_LIMIT = 256;
 const QUICK_CHAT_SITE_ALIASES: Readonly<Record<string, string>> = {
   github: "https://github.com",
@@ -242,8 +252,10 @@ function saveQuickChatWebsiteResolution(siteName: string, websiteUrl: string) {
 const DEFAULTS = {
   length: 80,
   thickness: 10,
+  barPosition: 50,
   edge: "left" as Edge,
   closeDelay: 200,
+  interactionMode: "hover" as InteractionMode,
 };
 const MIN_LENGTH = 48;
 const MAX_LENGTH = 240;
@@ -288,7 +300,8 @@ let mediaRefreshBusy = false;
 let mediaUpdatedAt = 0;
 let mediaSeekDragging = false;
 let expanded = onboardingOpen;
-let settingsOpen = false;
+let settingsTab: SettingsTab = readChoice(KEYS.settingsTab, ["general", "shortcuts"], "general");
+let onboardingInteractionMode: InteractionMode = readChoice(KEYS.interactionMode, ["hover", "click"], "hover");
 let activeTab: MenuTab = "home";
 let activeHomeView: HomeView = "now";
 let utilityPopupMode: UtilityPopupMode | null = null;
@@ -321,6 +334,8 @@ let quickChatSelectedModel = localStorage.getItem(KEYS.quickChatModel) || "gpt-6
 let quickChatSelectedReasoning = localStorage.getItem(KEYS.quickChatReasoning) || "low";
 let barLength = readNumber(KEYS.length, DEFAULTS.length, MIN_LENGTH, MAX_LENGTH, LENGTH_STEP);
 let barThickness = readNumber(KEYS.thickness, DEFAULTS.thickness, MIN_THICKNESS, MAX_THICKNESS);
+let barPosition = readNumber(KEYS.barPosition, 50, 0, 100);
+let interactionMode: InteractionMode = readChoice(KEYS.interactionMode, ["hover", "click"], "hover");
 let edge = readEdge();
 let closeDelay = readNumber(KEYS.closeDelay, DEFAULTS.closeDelay, MIN_CLOSE_DELAY, MAX_CLOSE_DELAY, 50);
 let allDisplays = localStorage.getItem(KEYS.allDisplays) === "true";
@@ -379,6 +394,7 @@ let vercelTeamId = localStorage.getItem(KEYS.vercelTeamId) ?? "";
 let vercelRefreshInterval: number | undefined;
 let soundEnabled = localStorage.getItem(KEYS.soundsEnabled) === "true";
 let soundVolume = readNumber(KEYS.soundVolume, 24, 0, 100);
+let externalLayoutSyncTimer: number | undefined;
 let availableAppUpdate: Update | null = null;
 let appUpdateChecking = false;
 let appUpdateInstalling = false;
@@ -695,18 +711,14 @@ function bindGithubActions(container: ParentNode) {
   container.querySelectorAll<HTMLButtonElement>("[data-action=github-refresh]").forEach((button) => button.addEventListener("click", () => void refreshGithubSnapshot()));
   container.querySelectorAll<HTMLButtonElement>("[data-action=vercel-refresh]").forEach((button) => button.addEventListener("click", () => void refreshVercelSnapshot()));
   container.querySelectorAll<HTMLButtonElement>("[data-action=github-open-settings]").forEach((button) => button.addEventListener("click", () => {
-    settingsOpen = true;
-    expanded = true;
-    render();
+    openSettingsWindow("general");
   }));
   container.querySelectorAll<HTMLButtonElement>("[data-action=open-github-link]").forEach((button) => button.addEventListener("click", () => {
     const url = safeQuickChatWebsiteUrl(button.dataset.url);
     if (url) void invoke("open_targets", { targets: [url] }).catch(() => undefined);
   }));
   container.querySelectorAll<HTMLButtonElement>("[data-action=vercel-open-settings]").forEach((button) => button.addEventListener("click", () => {
-    settingsOpen = true;
-    expanded = true;
-    render();
+    openSettingsWindow("general");
   }));
   container.querySelectorAll<HTMLButtonElement>("[data-action=open-vercel-link]").forEach((button) => button.addEventListener("click", () => {
     const url = safeQuickChatWebsiteUrl(button.dataset.url);
@@ -1129,10 +1141,26 @@ function currentRadius(style: CSSStyleDeclaration) {
   return Number.parseFloat(value) || 14;
 }
 
+function setBodyPosition(body: HTMLElement, width: number, height: number) {
+  const currentEdge = (body.closest<HTMLElement>(".edge-island")?.dataset.edge ?? edge) as Edge;
+  const position = Math.min(1, Math.max(0, barPosition / 100));
+  const availableWidth = Math.max(0, window.innerWidth - width);
+  const availableHeight = Math.max(0, window.innerHeight - height);
+
+  body.style.left = currentEdge === "left" ? "0px" : `${availableWidth * position}px`;
+  body.style.right = "auto";
+  body.style.top = currentEdge === "left" || currentEdge === "top"
+    ? `${currentEdge === "left" ? availableHeight * position : 0}px`
+    : "auto";
+  body.style.bottom = currentEdge === "bottom" ? "0px" : "auto";
+  body.style.transform = "none";
+}
+
 function setBodyGeometry(body: HTMLElement, width: number, height: number, radius: number) {
   body.style.width = `${width}px`;
   body.style.height = `${height}px`;
   body.style.borderRadius = radiusString(radius);
+  setBodyPosition(body, width, height);
   positionCodexMediaBubble(body);
   publishNativeHitBounds(body);
 }
@@ -1275,10 +1303,10 @@ function expandedIslandSize() {
   const horizontal = edge !== "left";
   const preferredWidth = activeTab === "home" && activeHomeView === "media" ? horizontal ? 1000 : 420
     : horizontal ? 960 : 420;
-  const preferredHeight = settingsOpen || onboardingOpen
+  const preferredHeight = onboardingOpen
     ? horizontal ? 380 : 620
     : activeTab === "home" ? horizontal ? 210 : 480
-      : activeTab === "pet" ? horizontal ? 210 : 480
+      : activeTab === "pet" ? horizontal ? 320 : 620
         : horizontal ? 380 : 620;
   return {
     width: Math.min(preferredWidth, Math.max(220, window.innerWidth - (horizontal ? 40 : 32))),
@@ -1360,6 +1388,7 @@ function getSelectedDisplayIds() {
 function persistSettings() {
   localStorage.setItem(KEYS.length, String(barLength));
   localStorage.setItem(KEYS.thickness, String(barThickness));
+  localStorage.setItem(KEYS.barPosition, String(barPosition));
   localStorage.setItem(KEYS.edge, edge);
   localStorage.setItem(KEYS.closeDelay, String(closeDelay));
   localStorage.setItem(KEYS.displays, JSON.stringify(selectedDisplayIds));
@@ -1371,6 +1400,7 @@ function applyIslandVariables(island: HTMLElement) {
   island.style.setProperty("--bar-length", `${barLength}px`);
   island.style.setProperty("--bar-half-length", `${barLength / 2}px`);
   island.style.setProperty("--bar-thickness", `${barThickness}px`);
+  island.style.setProperty("--bar-position", String(barPosition / 100));
   const expandedSize = expandedIslandSize();
   island.style.setProperty("--expanded-width", `${expandedSize.width}px`);
   island.style.setProperty("--expanded-height", `${expandedSize.height}px`);
@@ -1387,6 +1417,7 @@ function applyDisplayLayout(isExpanded = expanded) {
     selectedDisplayIds: ids,
     allDisplays: false,
     closeDelay,
+    positionPercent: barPosition,
     expanded: isExpanded,
   }).then(() => {
     const body = app.querySelector<HTMLElement>(".island-body");
@@ -1649,26 +1680,31 @@ function renderPetPage() {
   const held = pocketItems[0];
   return `
     <div class="pet-page" data-mood="${mood}" data-item-type="${held?.kind ?? "none"}">
-      <div class="pet-stage ${pocketDropActive ? "is-dragging" : ""} ${petDropFeedback ? "has-drop-feedback" : ""}" data-dropzone="pocket">
-        ${renderPetCharacter("pet-large")}
-        <span class="pet-name">${escapeHtml(petName)}</span>
-        <strong class="pet-drop-prompt" aria-live="polite">${pocketDropActive ? "Pode soltar, eu pego!" : escapeHtml(petDropFeedback)}</strong>
-     <div class="pet-tools" aria-label="Ações do Ghosty">
-          <button class="pet-tool" data-action="open-utility-popup" data-popup="pocket" aria-label="Abrir bolso do Ghosty" title="Bolso">${menuIcon("pocket")}</button>
-          <button class="pet-tool" data-action="open-utility-popup" data-popup="customize" aria-label="Personalizar Ghosty" title="Personalizar">${menuIcon("settings")}</button>
+      <section class="pet-hero-card">
+        <div class="pet-stage ${pocketDropActive ? "is-dragging" : ""} ${petDropFeedback ? "has-drop-feedback" : ""}" data-dropzone="pocket" aria-label="Ghosty. Solte arquivos ou textos para guardar no Bolso.">
+          <div class="pet-orbit" aria-hidden="true"><i></i><i></i><i></i><span>✦</span><span>·</span><span>✧</span></div>
+          ${renderPetCharacter("pet-large")}
+          <span class="pet-drop-prompt" aria-live="polite">${pocketDropActive ? "Pode soltar, eu pego!" : escapeHtml(petDropFeedback || "Arraste algo para mim")}</span>
         </div>
-      </div>
+        <div class="pet-profile-copy">
+          <span class="section-kicker">SEU COMPANHEIRO</span>
+          <strong>${escapeHtml(petName)}</strong>
+          <p>Um cantinho para o que você está fazendo agora.</p>
+          <div class="pet-side-status" data-mood="${mood}"><i></i><span>${escapeHtml(petMoodLabel(mood))}</span></div>
+          <div class="pet-side-actions">
+            <button data-action="open-utility-popup" data-popup="pocket">Abrir Bolso</button>
+            <button data-action="open-utility-popup" data-popup="customize">Personalizar</button>
+            <button data-action="open-utility-popup" data-popup="focus">Iniciar Foco</button>
+          </div>
+        </div>
+      </section>
       <aside class="pet-side-panel">
-        <span class="section-kicker">SEU COMPANHEIRO</span>
-        <strong>${escapeHtml(petName)}</strong>
-        <p>Um cantinho para o que você está fazendo agora.</p>
-        <div class="pet-side-status" data-mood="${mood}"><i></i><span>${escapeHtml(petMoodLabel(mood))}</span></div>
-        <div class="pet-side-pocket"><small>BOLSO DO GHOSTY</small><strong>${pocketItems.length}/8 itens guardados</strong><span>${held ? escapeHtml(held.name) : "Solte algo no Ghosty para guardar."}</span></div>
-        <div class="pet-side-actions">
-          <button data-action="open-utility-popup" data-popup="pocket">Abrir Bolso</button>
-          <button data-action="open-utility-popup" data-popup="customize">Personalizar</button>
-          <button data-action="open-utility-popup" data-popup="focus">Iniciar Foco</button>
+        <div class="pet-side-pocket">
+          <div class="pet-pocket-heading"><span class="pet-pocket-icon">${menuIcon("pocket")}</span><span><small>BOLSO DO GHOSTY</small><strong>${pocketItems.length}<i>/8</i> itens guardados</strong></span><button data-action="open-utility-popup" data-popup="pocket" aria-label="Abrir Bolso">${menuIcon("chevron")}</button></div>
+          <span class="pet-pocket-latest">${held ? `Mais recente · ${escapeHtml(held.name)}` : "Solte arquivos, imagens ou textos no Ghosty."}</span>
+          <div class="pet-pocket-meter" aria-hidden="true"><i style="width:${Math.min(100, pocketItems.length / 8 * 100)}%"></i></div>
         </div>
+        <div class="pet-companion-note"><span>✦</span><p>${pocketItems.length > 0 ? "Seu Bolso está guardado com carinho." : "Pode arrastar algo para mim. Eu guardo sem mexer no original."}</p></div>
       </aside>
     </div>`;
 }
@@ -2606,6 +2642,19 @@ async function openUtilityPopup(mode: UtilityPopupMode) {
   }
 }
 
+function openSettingsWindow(tab: SettingsTab = "general") {
+  settingsTab = tab;
+  localStorage.setItem(KEYS.settingsTab, tab);
+  void invoke("show_settings_window").catch((error) => {
+    console.error("Não consegui abrir as configurações do Edge Ghosty", error);
+  });
+}
+
+function refreshShortcutsScreen() {
+  if (currentWindowLabel === "settings-window") renderSettingsWindow();
+  else openSettingsWindow("shortcuts");
+}
+
 function formatFileSize(bytes: number) {
   if (bytes < 1_024) return `${bytes} B`;
   const units = ["KiB", "MiB", "GiB", "TiB"];
@@ -2739,15 +2788,20 @@ function renderOnboarding() {
   if (onboardingStep === "welcome") {
     return `
       <section class="onboarding-page onboarding-welcome">
-        <div class="onboarding-step-label">CONFIGURAÇÃO RÁPIDA <span>1 DE 2</span></div>
+        <div class="onboarding-step-label">SEU NOVO COMPANHEIRO <span>1 DE 2</span></div>
         <div class="onboarding-welcome-row">
-          ${renderPetCharacter("onboarding-pet")}
-          <div><h1>Vamos preparar seu Ghosty</h1><p>Passe o cursor pela barrinha na borda para abrir o Ghosty. Use os ícones do topo para alternar entre Home, Pet e Atalhos; a tela continua clicável quando a ilha está recolhida.</p></div>
+          <div class="onboarding-hero" aria-hidden="true">
+            <div class="onboarding-orbit"></div>
+            <i class="onboarding-particle particle-a">✦</i><i class="onboarding-particle particle-b">✧</i><i class="onboarding-particle particle-c">·</i><i class="onboarding-particle particle-d">✦</i><i class="onboarding-particle particle-e">·</i><i class="onboarding-particle particle-f">✧</i>
+            ${renderPetCharacter("onboarding-pet")}
+            <span class="onboarding-greeting-bubble">Oi! Prazer em te conhecer ✨</span>
+          </div>
+          <div class="onboarding-welcome-copy"><span class="onboarding-welcome-kicker">UM CANTINHO SEU NA BORDA</span><h1>Oi! Eu sou o Ghosty.</h1><p>Vou ficar por perto para cuidar dos seus atalhos, acompanhar seu foco e guardar as coisinhas que você me confiar.</p></div>
         </div>
         <div class="onboarding-benefits">
           <div><span>HOME</span><p>Controle mídia e volume sem sair do que está fazendo.</p></div>
           <div><span>FOCO</span><p>Inicie um temporizador e acompanhe seu ritmo semanal.</p></div>
-          <div><span>ATALHOS</span><p>Abra seus aplicativos, arquivos e sites favoritos.</p></div>
+          <div><span>ATALHOS</span><p>Abra seus destinos ou peça por eles no chat rápido.</p></div>
         </div>
         <div class="onboarding-actions">
           <button class="onboarding-primary" data-action="onboarding-next">Configurar agora <span>→</span></button>
@@ -2766,7 +2820,14 @@ function renderOnboarding() {
     <section class="onboarding-page onboarding-choices">
       <div class="onboarding-step-label"><button data-action="onboarding-back" aria-label="Voltar">←</button> CONFIGURAÇÃO RÁPIDA <span>2 DE 2</span></div>
       <h1>Deixe tudo pronto</h1>
-      <p class="onboarding-lead">Você pode mudar estas escolhas depois nas Configurações e em Atalhos.</p>
+      <p class="onboarding-lead">Você pode mudar estas escolhas depois nas Configurações.</p>
+      <div class="onboarding-mode-picker">
+        <span class="onboarding-mode-title">Como você quer abrir o menu?</span>
+        <div class="onboarding-mode-options" role="radiogroup" aria-label="Modo de abertura do menu">
+          <label class="onboarding-mode-option ${onboardingInteractionMode === "hover" ? "is-selected" : ""}"><input type="radio" name="onboarding-interaction-mode" value="hover" ${onboardingInteractionMode === "hover" ? "checked" : ""} /><span><strong>Passar o cursor</strong><small>Abre ao encostar na barrinha.</small></span><i></i></label>
+          <label class="onboarding-mode-option ${onboardingInteractionMode === "click" ? "is-selected" : ""}"><input type="radio" name="onboarding-interaction-mode" value="click" ${onboardingInteractionMode === "click" ? "checked" : ""} /><span><strong>Clicar</strong><small>Abre quando você clicar na barrinha.</small></span><i></i></label>
+        </div>
+      </div>
       <label class="onboarding-startup-option">
         <input type="checkbox" data-autostart-toggle ${autoStartEnabled ? "checked" : ""} ${autoStartLoading || autoStartBusy ? "disabled" : ""} />
         <span><strong>Iniciar com o Windows</strong><small>O Ghosty estará disponível quando você entrar no computador.</small></span>
@@ -2785,7 +2846,6 @@ function renderOnboarding() {
 function renderActiveTab() {
   if (onboardingOpen) return renderOnboarding();
   if (activeTab === "pet") return renderPetPage();
-  if (activeTab === "shortcuts") return renderShortcutsPage();
   return renderHomePage();
 }
 
@@ -2847,10 +2907,11 @@ function finishOnboarding(applyChoices: boolean) {
     persistShortcuts();
   }
   localStorage.setItem(KEYS.onboardingComplete, "true");
+  interactionMode = onboardingInteractionMode;
+  localStorage.setItem(KEYS.interactionMode, interactionMode);
   onboardingOpen = false;
   onboardingStep = "welcome";
   activeTab = "home";
-  settingsOpen = false;
   render();
   setExpanded(false);
 }
@@ -2859,7 +2920,7 @@ function openOnboarding() {
   onboardingOpen = true;
   onboardingStep = "welcome";
   onboardingSelectedShortcutIds = new Set(shortcuts.slice(0, 3).map((shortcut) => shortcut.id));
-  settingsOpen = false;
+  onboardingInteractionMode = interactionMode;
   activeTab = "home";
   render();
   setExpanded(true);
@@ -2897,6 +2958,16 @@ function bindOnboarding(container: HTMLElement) {
       else onboardingSelectedShortcutIds.delete(id);
       if (status) status.textContent = `${onboardingSelectedShortcutIds.size} de 3 selecionados`;
       if (message) message.textContent = "";
+    });
+  });
+  container.querySelectorAll<HTMLInputElement>("[name=onboarding-interaction-mode]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const value = input.value;
+      if (value !== "hover" && value !== "click") return;
+      onboardingInteractionMode = value;
+      container.querySelectorAll<HTMLElement>(".onboarding-mode-option").forEach((option) => {
+        option.classList.toggle("is-selected", option.querySelector<HTMLInputElement>("input")?.checked === true);
+      });
     });
   });
   paintAutoStartControls();
@@ -3775,7 +3846,7 @@ async function bindNativeFileDrop() {
       if (event.payload.type === "enter") {
         pocketDropActive = true;
         const utilityPopup = getCurrentWindow().label === "utility-popup";
-        if (!utilityPopup && !settingsOpen) updateActiveTab("pet");
+        if (!utilityPopup) updateActiveTab("pet");
         if (!utilityPopup) setExpanded(true);
         app.querySelector<HTMLElement>(".edge-island")?.classList.add("is-file-dragging");
         const dropzone = app.querySelector<HTMLElement>("[data-dropzone=pocket]");
@@ -3854,7 +3925,7 @@ function bindTabContent(tabView: HTMLElement) {
     const view = button.dataset.homeView;
     if (view === "now" || view === "activity" || view === "github" || view === "vercel" || view === "media") updateActiveHomeView(view);
   }));
-  tabView.querySelector<HTMLButtonElement>("[data-action=open-shortcuts]")?.addEventListener("click", () => updateActiveTab("shortcuts"));
+  tabView.querySelector<HTMLButtonElement>("[data-action=open-shortcuts]")?.addEventListener("click", () => openSettingsWindow("shortcuts"));
   const volumeSlider = tabView.querySelector<HTMLInputElement>("#volume");
   volumeSlider?.addEventListener("input", (event) => {
     volume = Number((event.target as HTMLInputElement).value);
@@ -3950,7 +4021,7 @@ function bindTabContent(tabView: HTMLElement) {
     if (!name || targets.length === 0) return;
     shortcuts.push({ id: makeId(), name: name.slice(0, 24), glyph: "↗", targets, custom: true });
     persistShortcuts();
-    updateActiveTab("shortcuts");
+    refreshShortcutsScreen();
   });
   tabView.querySelector("[data-action=toggle-shortcut-form]")?.addEventListener("click", () => {
     const customForm = tabView.querySelector<HTMLFormElement>("[data-action=shortcut-form]");
@@ -3965,7 +4036,7 @@ function bindTabContent(tabView: HTMLElement) {
   tabView.querySelectorAll<HTMLButtonElement>("[data-action=remove-shortcut]").forEach((button) => button.addEventListener("click", () => {
     shortcuts = shortcuts.filter((item) => item.id !== button.dataset.shortcutId);
     persistShortcuts();
-    updateActiveTab("shortcuts");
+    refreshShortcutsScreen();
   }));
 
   const grid = tabView.querySelector<HTMLElement>("[data-dropzone=shortcuts]");
@@ -3985,7 +4056,7 @@ function bindTabContent(tabView: HTMLElement) {
       shortcuts.splice(Math.min(to, shortcuts.length), 0, moved);
       draggedId = "";
       persistShortcuts();
-      updateActiveTab("shortcuts");
+      refreshShortcutsScreen();
     });
     grid.querySelectorAll<HTMLElement>(".shortcut-item").forEach((item) => {
       item.addEventListener("dragstart", (event) => {
@@ -4206,14 +4277,19 @@ async function installAppUpdate() {
 }
 
 function renderSettingsContent() {
+  if (settingsTab === "shortcuts") {
+    return `
+      <div class="settings-shortcuts-view">
+        <section class="quick-chat-shortcuts-banner">
+          <span class="quick-chat-shortcuts-icon" aria-hidden="true">✦</span>
+          <div><small>CHAT RÁPIDO</small><strong>Seus atalhos também são comandos do Ghosty</strong><p>No chat rápido, peça pelo nome para abrir um atalho que você salvou aqui. O Ghosty usa apenas os destinos configurados nesta tela.</p></div>
+        </section>
+        ${renderShortcutsPage()}
+      </div>`;
+  }
   const lengthLabel = edge === "left" ? "Altura da barrinha" : "Largura da barrinha";
   return `
     <div class="settings-page">
-     <header class="menu-header settings-header">
-        <button class="back-button" data-action="settings-back" aria-label="Voltar ao menu">${menuIcon("back")}</button>
-        <div><strong>Configurações</strong><small>aparência e comportamento</small></div>
-        <button class="icon-button close-button" data-action="close" aria-label="Fechar">${menuIcon("close")}</button>
-      </header>
       <div class="settings-scroll">
         <section class="settings-context-card">
         <p class="settings-intro">Ajuste a barrinha e escolha a tela onde o Edge Ghosty aparece.</p>
@@ -4228,12 +4304,28 @@ function renderSettingsContent() {
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-length">${lengthLabel}</label><output id="bar-length-value">${barLength} px</output></div>
           <input id="bar-length" type="range" min="${MIN_LENGTH}" max="${MAX_LENGTH}" step="${LENGTH_STEP}" value="${barLength}" />
+          <label class="setting-custom-number"><span>Valor personalizado</span><span><input type="number" data-number-for="bar-length" min="${MIN_LENGTH}" max="${MAX_LENGTH}" step="${LENGTH_STEP}" value="${barLength}" aria-label="Valor personalizado para ${lengthLabel.toLowerCase()}" /> px</span></label>
           <div class="range-labels"><span>${MIN_LENGTH} px</span><span>${MAX_LENGTH} px</span></div>
         </section>
         <section class="control-card setting-card">
           <div class="setting-heading"><label for="bar-thickness">Espessura da barrinha</label><output id="bar-thickness-value">${barThickness} px</output></div>
           <input id="bar-thickness" type="range" min="${MIN_THICKNESS}" max="${MAX_THICKNESS}" value="${barThickness}" />
+          <label class="setting-custom-number"><span>Valor personalizado</span><span><input type="number" data-number-for="bar-thickness" min="${MIN_THICKNESS}" max="${MAX_THICKNESS}" step="1" value="${barThickness}" aria-label="Valor personalizado para espessura da barrinha" /> px</span></label>
           <div class="range-labels"><span>${MIN_THICKNESS} px</span><span>${MAX_THICKNESS} px</span></div>
+        </section>
+        <section class="control-card setting-card">
+          <div class="setting-heading"><label for="bar-position">Posição na borda</label><output id="bar-position-value">${barPosition}%</output></div>
+          <p class="settings-note">Escolha onde a barrinha fica ao longo da lateral. Ela permanece dentro dos limites da tela.</p>
+          <input id="bar-position" type="range" min="0" max="100" step="1" value="${barPosition}" />
+          <div class="range-labels"><span>Início da borda</span><span>Fim da borda</span></div>
+        </section>
+        <section class="control-card setting-card">
+          <div class="setting-heading">Como abrir o Ghosty</div>
+          <p class="settings-note">Escolha se a barrinha abre ao passar o cursor ou ao clicar.</p>
+          <div class="interaction-choice-list" role="radiogroup" aria-label="Modo de abertura">
+            <label class="interaction-choice ${interactionMode === "hover" ? "is-selected" : ""}"><input type="radio" name="interaction-mode" value="hover" ${interactionMode === "hover" ? "checked" : ""} /><span><strong>Ao passar o cursor</strong><small>Abre ao encostar na barrinha.</small></span><i aria-hidden="true"></i></label>
+            <label class="interaction-choice ${interactionMode === "click" ? "is-selected" : ""}"><input type="radio" name="interaction-mode" value="click" ${interactionMode === "click" ? "checked" : ""} /><span><strong>Ao clicar</strong><small>Fica aberto até você fechar no ×.</small></span><i aria-hidden="true"></i></label>
+          </div>
         </section>
         <section class="control-card setting-card">
           <label class="setting-heading" for="edge-select">Borda da tela</label>
@@ -4311,6 +4403,48 @@ function renderSettingsContent() {
     </div>`;
 }
 
+function renderSettingsWindow() {
+  document.body.dataset.window = "settings";
+  const title = settingsTab === "shortcuts" ? "Atalhos" : "Geral";
+  const subtitle = settingsTab === "shortcuts"
+    ? "Organize o que o Ghosty pode abrir por você."
+    : "Ajuste a barrinha, o comportamento e as integrações.";
+  app.innerHTML = `
+    <div class="settings-shell">
+      <aside class="settings-sidebar">
+        <div class="settings-brand"><span class="settings-brand-mark">${menuIcon("brand")}</span><span><strong>Edge Ghosty</strong><small>Preferências</small></span></div>
+        <nav class="settings-nav" aria-label="Configurações">
+          <button class="settings-nav-item ${settingsTab === "general" ? "is-active" : ""}" data-settings-tab="general"><span>${menuIcon("settings")}</span>Geral</button>
+          <button class="settings-nav-item ${settingsTab === "shortcuts" ? "is-active" : ""}" data-settings-tab="shortcuts"><span>${menuIcon("shortcuts")}</span>Atalhos</button>
+        </nav>
+        <div class="settings-sidebar-pet">
+          ${renderPetCharacter("settings-sidebar-ghosty")}
+          <span><strong>${escapeHtml(petName)}</strong><small>sempre por perto</small></span>
+        </div>
+      </aside>
+      <main class="settings-workspace">
+        <header class="settings-window-header"><div><span class="settings-eyebrow">EDGE GHOSTY · CONFIGURAÇÕES</span><h1>${title}</h1><p>${subtitle}</p></div><button class="settings-window-close" data-action="settings-window-close" aria-label="Ocultar configurações" title="Fechar">×</button></header>
+        <div class="settings-content">${renderSettingsContent()}</div>
+      </main>
+    </div>`;
+  bindPetInteractions(app);
+  app.querySelectorAll<HTMLButtonElement>("[data-settings-tab]").forEach((button) => button.addEventListener("click", () => {
+    const tab = button.dataset.settingsTab;
+    if (tab !== "general" && tab !== "shortcuts") return;
+    settingsTab = tab;
+    localStorage.setItem(KEYS.settingsTab, tab);
+    renderSettingsWindow();
+  }));
+  app.querySelector<HTMLButtonElement>("[data-action=settings-window-close]")?.addEventListener("click", () => {
+    void getCurrentWindow().hide().catch(() => undefined);
+  });
+  if (settingsTab === "shortcuts") {
+    const shortcutContent = app.querySelector<HTMLElement>(".settings-content");
+    if (shortcutContent) bindTabContent(shortcutContent);
+  }
+  bindSettings();
+}
+
 function setExpanded(value: boolean) {
   if (expanded === value) return;
   const island = app.querySelector<HTMLElement>(".edge-island");
@@ -4360,6 +4494,8 @@ function bindRange(
     update(value);
     const output = app.querySelector<HTMLOutputElement>(outputSelector);
     if (output) output.value = format(value);
+    const customNumber = app.querySelector<HTMLInputElement>(`[data-number-for="${selector.slice(1)}"]`);
+    if (customNumber) customNumber.value = String(value);
     const island = app.querySelector<HTMLElement>(".edge-island");
     if (island) {
       applyIslandVariables(island);
@@ -4368,6 +4504,24 @@ function bindRange(
     }
     persistSettings();
   });
+}
+
+function bindCustomRangeNumbers() {
+  app.querySelectorAll<HTMLInputElement>("[data-number-for]").forEach((input) => input.addEventListener("change", () => {
+    const id = input.dataset.numberFor;
+    const range = id ? app.querySelector<HTMLInputElement>(`#${id}`) : null;
+    if (!range) return;
+    const minimum = Number(range.min);
+    const maximum = Number(range.max);
+    const step = Number(range.step) || 1;
+    const typed = Number(input.value);
+    const bounded = Math.max(minimum, Math.min(maximum, Number.isFinite(typed) ? typed : Number(range.value)));
+    const snapped = Math.max(minimum, Math.min(maximum, minimum + Math.round((bounded - minimum) / step) * step));
+    input.value = String(snapped);
+    range.value = String(snapped);
+    range.dispatchEvent(new Event("input", { bubbles: true }));
+    range.dispatchEvent(new Event("change", { bubbles: true }));
+  }));
 }
 
 function bindSettings() {
@@ -4419,15 +4573,33 @@ function bindSettings() {
     const output = app.querySelector<HTMLOutputElement>("#sound-volume-value");
     if (output) output.value = `${soundVolume}%`;
   });
-  if (settingsOpen) {
+  if (currentWindowLabel === "settings-window") {
     app.querySelector<HTMLInputElement>("[data-autostart-toggle]")?.addEventListener("change", (event) => {
       void setAutoStartEnabled((event.target as HTMLInputElement).checked);
     });
   }
-  app.querySelector<HTMLButtonElement>("[data-action=reopen-onboarding]")?.addEventListener("click", openOnboarding);
+  app.querySelector<HTMLButtonElement>("[data-action=reopen-onboarding]")?.addEventListener("click", () => {
+    if (currentWindowLabel === "settings-window") void invoke("open_onboarding").catch(() => undefined);
+    else openOnboarding();
+  });
   bindRange("#bar-length", (value) => { barLength = value; }, "#bar-length-value", (value) => `${value} px`);
   bindRange("#bar-thickness", (value) => { barThickness = value; }, "#bar-thickness-value", (value) => `${value} px`);
+  bindRange("#bar-position", (value) => { barPosition = value; }, "#bar-position-value", (value) => `${value}%`);
   bindRange("#close-delay", (value) => { closeDelay = value; }, "#close-delay-value", (value) => `${value} ms`);
+  bindCustomRangeNumbers();
+
+  app.querySelectorAll<HTMLInputElement>("[name=interaction-mode]").forEach((input) => input.addEventListener("change", () => {
+    const value = input.value;
+    if (value !== "hover" && value !== "click") return;
+    interactionMode = value;
+    localStorage.setItem(KEYS.interactionMode, value);
+    app.querySelectorAll<HTMLElement>(".interaction-choice").forEach((choice) => {
+      choice.classList.toggle("is-selected", choice.querySelector<HTMLInputElement>("input")?.checked === true);
+    });
+  }));
+  app.querySelectorAll<HTMLInputElement>("#bar-length, #bar-thickness, #bar-position")
+    .forEach((input) => input.addEventListener("change", () => void applyDisplayLayout()));
+  app.querySelectorAll<HTMLInputElement>("[data-number-for]").forEach((input) => input.addEventListener("change", () => void applyDisplayLayout()));
 
   app.querySelector<HTMLSelectElement>("#edge-select")?.addEventListener("change", (event) => {
     edge = (event.target as HTMLSelectElement).value as Edge;
@@ -4461,6 +4633,10 @@ function bindCodexApprovalButtons(container: ParentNode) {
 }
 
 function render() {
+  if (currentWindowLabel === "settings-window") {
+    renderSettingsWindow();
+    return;
+  }
   const previousIsland = app.querySelector<HTMLElement>(".edge-island");
   const previousBody = previousIsland?.querySelector<HTMLElement>(".island-body");
   const previousGeometry = previousBody
@@ -4473,7 +4649,7 @@ function render() {
     }
     : null;
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${shouldShowCollapsedMediaCapsule(previousIsland) ? "is-media-capsule" : ""} ${codexTaskRunning && mediaInfo.playing ? "is-codex-media-active" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${settingsOpen ? "settings-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${shouldShowCollapsedMediaCapsule(previousIsland) ? "is-media-capsule" : ""} ${codexTaskRunning && mediaInfo.playing ? "is-codex-media-active" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
         <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
         <div class="media-peek" aria-hidden="true"><img alt="" draggable="false"${mediaInfo.artworkDataUrl ? ` src="${escapeHtml(mediaInfo.artworkDataUrl)}"` : ""}></div>
@@ -4483,7 +4659,6 @@ function render() {
             ${onboardingOpen ? '<div class="onboarding-brand">EDGE GHOSTY</div>' : `<nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
               <button class="icon-button menu-tab ${activeTab === "home" ? "is-active" : ""}" aria-pressed="${activeTab === "home"}" data-tab="home" aria-label="Início" title="Início">${menuIcon("home")}</button>
               <button class="icon-button menu-tab ${activeTab === "pet" ? "is-active" : ""}" aria-pressed="${activeTab === "pet"}" data-tab="pet" aria-label="Pet" title="Pet">${menuIcon("pet")}</button>
-              <button class="icon-button menu-tab ${activeTab === "shortcuts" ? "is-active" : ""}" aria-pressed="${activeTab === "shortcuts"}" data-tab="shortcuts" aria-label="Atalhos" title="Atalhos">${menuIcon("shortcuts")}</button>
             </nav>`}
             ${onboardingOpen ? "" : `<div class="menu-header-actions">
               <button class="icon-button settings-button ${availableAppUpdate ? "has-app-update" : ""}" data-action="settings" aria-label="${availableAppUpdate ? "Configurações — atualização disponível" : "Abrir configurações"}" title="${availableAppUpdate ? "Atualização do Ghosty disponível" : "Configurações"}">${menuIcon("settings")}</button>
@@ -4534,14 +4709,15 @@ function render() {
 
   const island = app.querySelector<HTMLElement>(".edge-island")!;
   applyIslandVariables(island);
-  const islandContent = island.querySelector<HTMLElement>(".island-content")!;
-  if (settingsOpen) islandContent.innerHTML = renderSettingsContent();
 
   const body = island.querySelector<HTMLElement>(".island-body")!;
   if (previousGeometry) setBodyGeometry(body, previousGeometry.width, previousGeometry.height, previousGeometry.radius);
   else if (!expanded && island.classList.contains("is-media-capsule")) {
     const collapsedSize = collapsedIslandSize(island);
     setBodyGeometry(body, collapsedSize.width, collapsedSize.height, 14);
+  } else {
+    const rect = body.getBoundingClientRect();
+    setBodyPosition(body, rect.width, rect.height);
   }
   syncCodexMediaBubble(island);
   publishNativeHitBounds(body);
@@ -4550,16 +4726,22 @@ function render() {
       window.clearTimeout(hoverCloseTimer);
       hoverCloseTimer = undefined;
     }
+    if (interactionMode !== "hover") return;
     setExpanded(true);
   });
   body.addEventListener("pointerleave", () => {
     const pet = app.querySelector<HTMLElement>(".tab-view .pet");
     if (pet) petMotionEngines.get(pet)?.lookAt(0, 0);
-    if (expanded) scheduleClose();
+    if (interactionMode === "hover" && expanded) scheduleClose();
   });
   island.querySelector(".peek-line")?.addEventListener("click", (event) => {
     event.stopPropagation();
     setExpanded(!expanded);
+  });
+  body.addEventListener("click", (event) => {
+    if (interactionMode !== "click" || expanded) return;
+    event.stopPropagation();
+    setExpanded(true);
   });
 
   body.addEventListener("pointermove", (event) => {
@@ -4575,13 +4757,7 @@ function render() {
 
   app.querySelector("[data-action=settings]")?.addEventListener("click", (event) => {
     event.stopPropagation();
-    settingsOpen = true;
-    render();
-  });
-  app.querySelector("[data-action=settings-back]")?.addEventListener("click", (event) => {
-    event.stopPropagation();
-    settingsOpen = false;
-    render();
+    openSettingsWindow("general");
   });
   app.querySelector("[data-action=close]")?.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -4591,8 +4767,12 @@ function render() {
     event.stopPropagation();
     barLength = DEFAULTS.length;
     barThickness = DEFAULTS.thickness;
+    barPosition = DEFAULTS.barPosition;
     edge = DEFAULTS.edge;
     closeDelay = DEFAULTS.closeDelay;
+    interactionMode = DEFAULTS.interactionMode;
+    onboardingInteractionMode = interactionMode;
+    localStorage.setItem(KEYS.interactionMode, interactionMode);
     allDisplays = false;
     selectedDisplayIds = displays.find((display) => display.isPrimary)
       ? [displays.find((display) => display.isPrimary)!.id]
@@ -4605,6 +4785,15 @@ function render() {
 
   const tabView = island.querySelector<HTMLElement>(".tab-view");
   if (tabView) bindTabContent(tabView);
+  if (onboardingOpen && !onboardingIntroStarted) {
+    onboardingIntroStarted = true;
+    window.setTimeout(() => {
+      const pet = app.querySelector<HTMLElement>(".onboarding-pet");
+      if (!pet) return;
+      petMotionEngines.get(pet)?.welcome();
+      setPetMood("happy", 3600);
+    }, 220);
+  }
   const completionPet = island.querySelector<HTMLElement>(".ghosty-completion");
   if (completionPet) bindPetInteractions(completionPet);
   const inlineApproval = island.querySelector<HTMLElement>(".ghosty-inline-approval");
@@ -4692,17 +4881,44 @@ async function startMainWindow() {
   }
 }
 
+async function startSettingsWindow() {
+  renderSettingsWindow();
+  const currentWindow = getCurrentWindow();
+  void currentWindow.onCloseRequested((event) => {
+    event.preventDefault();
+    void currentWindow.hide().catch(() => undefined);
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") void currentWindow.hide().catch(() => undefined);
+  });
+  void refreshAutoStartStatus();
+  void checkForAppUpdate();
+  void refreshCodexHooksStatus();
+  void refreshGithubStatus();
+  void refreshVercelStatus();
+  try {
+    displays = await invoke<DisplayInfo[]>("list_displays");
+    if (!selectedDisplayIds.some((id) => displays.some((display) => display.id === id))) {
+      const primary = displays.find((display) => display.isPrimary) ?? displays[0];
+      selectedDisplayIds = primary ? [primary.id] : [];
+    }
+    renderSettingsWindow();
+  } catch {
+    // Settings stay usable if monitor enumeration is temporarily unavailable.
+  }
+}
+
 void listen<LayoutUpdate>("edge-ghosty-layout-updated", ({ payload }) => {
   if (payload.activeLabel === getCurrentWindow().label) return;
   edge = payload.edge;
   barLength = payload.barLength;
   barThickness = payload.barThickness;
+  barPosition = payload.positionPercent;
   closeDelay = payload.closeDelay;
   allDisplays = false;
   selectedDisplayIds = payload.selectedDisplayIds.slice(0, 1);
-  expanded = false;
-  persistSettings();
-  render();
+  if (currentWindowLabel === "settings-window") renderSettingsWindow();
+  else render();
 });
 
 void listen<CursorPosition>("edge-ghosty-cursor", ({ payload }) => {
@@ -4717,9 +4933,9 @@ void listen<CursorPosition>("edge-ghosty-cursor", ({ payload }) => {
       window.clearTimeout(hoverCloseTimer);
       hoverCloseTimer = undefined;
     }
-    if (!expanded && !pointerOnApproval) setExpanded(true);
+    if (interactionMode === "hover" && !expanded && !pointerOnApproval) setExpanded(true);
   } else if (!inIsland && wasPointerInNativeIsland && expanded) {
-    scheduleClose();
+    if (interactionMode === "hover") scheduleClose();
   }
   wasPointerInNativeIsland = inIsland;
 });
@@ -4853,11 +5069,14 @@ void listen<QuickChatEvent>("edge-ghosty-quick-chat-event", ({ payload }) => {
 });
 if (currentWindowLabel === "main") {
   void listen("edge-ghosty-quick-chat", () => { void openUtilityPopup("chat"); });
+  void listen("edge-ghosty-open-onboarding", () => openOnboarding());
   void listen<string>("edge-ghosty-tray-command", async ({ payload }) => {
     if (payload !== "open" && payload !== "settings") return;
-    settingsOpen = payload === "settings";
+    if (payload === "settings") {
+      openSettingsWindow("general");
+      return;
+    }
     await getCurrentWindow().show().catch(() => undefined);
-    if (settingsOpen) render();
     await getCurrentWindow().setFocus().catch(() => undefined);
     setExpanded(true);
   });
@@ -4910,6 +5129,40 @@ if (currentWindowLabel === "utility-popup") window.setInterval(() => {
 else window.setInterval(tickFeatures, 1000);
 
 window.addEventListener("storage", (event) => {
+  if (event.key === KEYS.settingsTab) {
+    settingsTab = readChoice(KEYS.settingsTab, ["general", "shortcuts"], "general");
+    if (currentWindowLabel === "settings-window") renderSettingsWindow();
+    return;
+  }
+  if ([KEYS.length, KEYS.thickness, KEYS.barPosition, KEYS.edge, KEYS.closeDelay, KEYS.displays, KEYS.interactionMode].includes(event.key ?? "")) {
+    if (externalLayoutSyncTimer !== undefined) window.clearTimeout(externalLayoutSyncTimer);
+    externalLayoutSyncTimer = window.setTimeout(() => {
+      externalLayoutSyncTimer = undefined;
+      barLength = readNumber(KEYS.length, DEFAULTS.length, MIN_LENGTH, MAX_LENGTH, LENGTH_STEP);
+      barThickness = readNumber(KEYS.thickness, DEFAULTS.thickness, MIN_THICKNESS, MAX_THICKNESS);
+      barPosition = readNumber(KEYS.barPosition, DEFAULTS.barPosition, 0, 100);
+      edge = readEdge();
+      closeDelay = readNumber(KEYS.closeDelay, DEFAULTS.closeDelay, MIN_CLOSE_DELAY, MAX_CLOSE_DELAY, 50);
+      selectedDisplayIds = readDisplayIds();
+      interactionMode = readChoice(KEYS.interactionMode, ["hover", "click"], "hover");
+      if (currentWindowLabel === "settings-window") {
+        renderSettingsWindow();
+        return;
+      }
+      const island = app.querySelector<HTMLElement>(".edge-island");
+      if (island) {
+        applyIslandVariables(island);
+        const body = island.querySelector<HTMLElement>(".island-body");
+        if (body) {
+          const rect = body.getBoundingClientRect();
+          setBodyPosition(body, rect.width, rect.height);
+          if (expanded) animateIsland(true);
+          publishNativeHitBounds(body);
+        }
+      }
+    }, 60);
+    return;
+  }
   if (event.key === KEYS.codexActivity) {
     codexActivity = loadCodexActivity();
     refreshCodexActivityUi();
@@ -4980,6 +5233,11 @@ window.addEventListener("storage", (event) => {
     }
     return;
   }
+  if (currentWindowLabel === "settings-window") {
+    if (event.key === KEYS.shortcuts) renderSettingsWindow();
+    else if (event.key === KEYS.petName) renderSettingsWindow();
+    return;
+  }
 
   if (event.key === KEYS.focus || event.key === KEYS.pocket || event.key === KEYS.petName || event.key === KEYS.petSkin || event.key === KEYS.petAccessory) {
     updatePetAtmosphere();
@@ -4997,6 +5255,7 @@ window.addEventListener("storage", (event) => {
 });
 if (currentWindowLabel === "main") void startMainWindow();
 else if (currentWindowLabel === "utility-popup") startUtilityPopupWindow();
+else if (currentWindowLabel === "settings-window") void startSettingsWindow();
 else {
   render();
   bindNativeFileDrop();

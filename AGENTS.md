@@ -241,6 +241,8 @@ npm run tauri dev
 
 ## Cuidados para próximas tarefas
 
+- No Windows, reaplicar `set_skip_taskbar(true)` imediatamente depois de cada `show()` da ilha e do popup. A chamada antes de mostrar pode não remover o botão que o Windows cria ao exibir a janela.
+
 - Atualizacao dos itens 51 e 52: o shell do app-server fica habilitado sob perfil inicial de leitura e `on-request`. No chat, aprovacoes valem por acao por padrao; a aprovacao automatica exige ativacao explicita e dura somente pela conversa atual. Desligar o modo impede novos aceites automaticos, mas nao revoga concessoes de sessao ja feitas; reinicie o chat para remove-las. Os hooks de aprovacao das sessoes locais do Codex continuam exigindo resposta explicita no Ghosty.
 
 - Manter o Edge Ghosty como painel rápido geral; o pet pode reagir a foco, tarefas do Codex e itens guardados sem tornar o produto dependente de agentes.
@@ -269,3 +271,6 @@ npm run tauri dev
 78. Em `2026-10-08-edge-ghosty-updater-tauri-github`, o app principal verifica atualizações assinadas ao iniciar e a cada seis horas; Configurações mostra disponibilidade, estado de download e comandos para verificar ou instalar/reiniciar. O plugin Tauri Updater baixa `latest.json` de `gusata/Ghosty` e gera artefatos NSIS assinados; depois do download, o plugin Process reinicia o app. A chave pública fica em `src-tauri/tauri.conf.json`; a chave privada fica fora do repositório e é injetada no workflow pelo segredo Actions `TAURI_SIGNING_PRIVATE_KEY`. Nunca versionar a chave privada. Após a correção do item 79, a versão 1.0.4 é a primeira que inclui o verificador.
 
 79. Após a publicação de `v1.0.3`, foi confirmado que o commit `f6cf588` não inclui o updater. A implementação local do updater foi alinhada para `1.0.4` em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json`. Usuários da 1.0.3 precisarão instalar a 1.0.4 manualmente uma vez; releases posteriores poderão chegar pelo updater.
+
+80. Em `2026-10-08-edge-ghosty-configuracoes-introducao-pet`, Configurações é uma janela normal, separada e visível na barra de tarefas, com abas Geral e Atalhos; a ilha mantém somente Início e Pet. O assistente da primeira execução apresenta o Ghosty com saudação, animação, partículas e escolha entre abrir ao passar o cursor ou clicar. Configurações permite informar valores numéricos para comprimento/espessura e ajustar a posição de 0 a 100% ao longo da borda; o host e a ilha mantêm a posição dentro do monitor. Atalhos destaca os destinos que o chat rápido pode abrir. A tela Pet aumentou e centralizou o personagem como elemento principal.
+81. Em `2026-10-08-edge-ghosty-abertura-geometria-animada`, a posição da ilha acompanha largura e altura em cada quadro de abertura/recolhimento. `setBodyPosition` ancora o corpo pela porcentagem configurada usando a geometria interpolada, evitando que os seletores CSS de expandido saltem imediatamente para a posição final. Ao receber preferências de outra janela, reposicionar a geometria atual antes de animar o novo alvo. O CSS não deve calcular a âncora usando apenas o tamanho final expandido.
