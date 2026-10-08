@@ -46,6 +46,8 @@ mod github;
 mod vercel;
 mod tray;
 
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DisplayInfo {
@@ -471,7 +473,8 @@ if ($null -ne $playback.Controls) { $canSeek = [bool]$playback.Controls.IsPlayba
     let mut command = Command::new("powershell.exe");
     command
         .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
-        .env("EDGE_GHOSTY_KNOWN_TRACK_ID", known_track_id.unwrap_or_default());
+        .env("EDGE_GHOSTY_KNOWN_TRACK_ID", known_track_id.unwrap_or_default())
+        .creation_flags(CREATE_NO_WINDOW);
     let output = command.output();
     if let Ok(output) = output {
         if output.status.success() {
@@ -513,6 +516,7 @@ if (-not $success) { exit 4 }
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-STA", "-Command", SCRIPT])
         .env("EDGE_GHOSTY_POSITION_MS", position_ms.to_string())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("iniciar busca da faixa: {error}"))?;
     if output.status.success() {
@@ -883,6 +887,9 @@ fn place_window(window: &WebviewWindow, edge: Edge, monitor: &Monitor) -> Result
         .map_err(|error| error.to_string())?;
     }
     window
+        .set_skip_taskbar(true)
+        .map_err(|error| error.to_string())?;
+    window
         .set_always_on_top(true)
         .map_err(|error| error.to_string())
 }
@@ -933,6 +940,10 @@ fn place_utility_popup(
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let scale = monitor.scale_factor();
+    popup
+        .set_skip_taskbar(true)
+        .map_err(|error| error.to_string())?;
+
     let logical_width = if quick_chat {
         (f64::from(monitor_size.width) / scale - 32.0).clamp(320.0, 560.0)
     } else {
@@ -1102,6 +1113,7 @@ pub fn run() {
                 cursor_state.ignoring.clone(),
             );
             if let Some(window) = app.get_webview_window("main") {
+                window.set_skip_taskbar(true)?;
                 if let Some(monitor) = window.primary_monitor()? {
                     window.set_ignore_cursor_events(true)?;
                     window.set_always_on_top(true)?;
