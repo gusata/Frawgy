@@ -6,6 +6,7 @@ import { check as checkAppUpdate, type Update } from "@tauri-apps/plugin-updater
 import { relaunch } from "@tauri-apps/plugin-process";
 import { Tracked } from "./anim";
 import { PetMotionEngine, type PetState } from "./pet-motion";
+import { LaunchGreeting } from "./launch-greeting";
 import { playGhostySound, setGhostySoundEnabled, setGhostySoundVolume } from "./sounds";
 
 type Shortcut = { id: string; name: string; glyph: string; targets: string[]; action?: "focus"; custom?: boolean };
@@ -27,7 +28,7 @@ type MediaInfo = {
   canSeek: boolean;
 };
 type AudioAppVolume = { processId: number; name: string; volume: number };
-type Edge = "left" | "top" | "bottom";
+type Edge = "left" | "right" | "top" | "bottom";
 type MenuTab = "home" | "pet";
 type SettingsTab = "general" | "shortcuts";
 type InteractionMode = "hover" | "click";
@@ -175,6 +176,15 @@ const currentWindowLabel = getCurrentWindow().label;
 let onboardingOpen = currentWindowLabel === "main" && localStorage.getItem(KEYS.onboardingComplete) !== "true";
 let onboardingStep: "welcome" | "choices" = "welcome";
 let onboardingIntroStarted = false;
+let onboardingLaunchGreetingActive = onboardingOpen;
+let onboardingLaunchDocking = false;
+let onboardingWelcomeOptionsRevealing = false;
+let launchGreetingStartedAt: number | null = null;
+let launchGreetingRenderer: LaunchGreeting | null = null;
+let onboardingLaunchDockTimer: number | undefined;
+let onboardingWelcomeRevealTimer: number | undefined;
+let onboardingLaunchDockOffset: { x: number; y: number; scale: number } | null = null;
+let launchGreetingReplayRestore: { edge: Edge; barPosition: number; onboardingIntroStarted: boolean } | null = null;
 const QUICK_CHAT_SITE_CACHE_LIMIT = 256;
 const QUICK_CHAT_SITE_ALIASES: Readonly<Record<string, string>> = {
   github: "https://github.com",
@@ -253,7 +263,7 @@ const DEFAULTS = {
   length: 80,
   thickness: 10,
   barPosition: 50,
-  edge: "left" as Edge,
+  edge: "top" as Edge,
   closeDelay: 200,
   interactionMode: "hover" as InteractionMode,
 };
@@ -280,7 +290,11 @@ function readNumber(key: string, fallback: number, min: number, max: number, ste
 
 function readEdge(): Edge {
   const stored = localStorage.getItem(KEYS.edge);
-  return stored === "top" || stored === "bottom" ? stored : "left";
+  return stored === "left" || stored === "right" || stored === "bottom" ? stored : "top";
+}
+
+function isVerticalEdge(value: Edge = edge) {
+  return value === "left" || value === "right";
 }
 
 function readDisplayIds(): string[] {
@@ -299,7 +313,7 @@ let audioMixerRefreshBusy = false;
 let mediaRefreshBusy = false;
 let mediaUpdatedAt = 0;
 let mediaSeekDragging = false;
-let expanded = onboardingOpen;
+let expanded = onboardingOpen && !onboardingLaunchGreetingActive;
 let settingsTab: SettingsTab = readChoice(KEYS.settingsTab, ["general", "shortcuts"], "general");
 let onboardingInteractionMode: InteractionMode = readChoice(KEYS.interactionMode, ["hover", "click"], "hover");
 let activeTab: MenuTab = "home";
@@ -334,13 +348,18 @@ let quickChatSelectedModel = localStorage.getItem(KEYS.quickChatModel) || "gpt-6
 let quickChatSelectedReasoning = localStorage.getItem(KEYS.quickChatReasoning) || "low";
 let barLength = readNumber(KEYS.length, DEFAULTS.length, MIN_LENGTH, MAX_LENGTH, LENGTH_STEP);
 let barThickness = readNumber(KEYS.thickness, DEFAULTS.thickness, MIN_THICKNESS, MAX_THICKNESS);
-let barPosition = readNumber(KEYS.barPosition, 50, 0, 100);
+let barPosition = onboardingOpen ? DEFAULTS.barPosition : readNumber(KEYS.barPosition, 50, 0, 100);
 let interactionMode: InteractionMode = readChoice(KEYS.interactionMode, ["hover", "click"], "hover");
-let edge = readEdge();
+let edge: Edge = onboardingOpen ? "top" : readEdge();
+if (onboardingOpen) {
+  localStorage.setItem(KEYS.edge, "top");
+  localStorage.setItem(KEYS.barPosition, String(DEFAULTS.barPosition));
+}
 let closeDelay = readNumber(KEYS.closeDelay, DEFAULTS.closeDelay, MIN_CLOSE_DELAY, MAX_CLOSE_DELAY, 50);
 let allDisplays = localStorage.getItem(KEYS.allDisplays) === "true";
 let selectedDisplayIds = readDisplayIds();
 let displays: DisplayInfo[] = [];
+let mainStartupPromise: Promise<void> | undefined;
 let draggedId = "";
 let shortcuts = readShortcuts();
 let onboardingSelectedShortcutIds = new Set(shortcuts.slice(0, 3).map((shortcut) => shortcut.id));
@@ -1129,6 +1148,7 @@ function updatePetAtmosphere() {
 function radiusString(radius: number) {
   if (edge === "top") return `0 0 ${radius}px ${radius}px`;
   if (edge === "bottom") return `${radius}px ${radius}px 0 0`;
+  if (edge === "right") return `${radius}px 0 0 ${radius}px`;
   return `0 ${radius}px ${radius}px 0`;
 }
 
@@ -1137,7 +1157,9 @@ function currentRadius(style: CSSStyleDeclaration) {
     ? style.borderBottomLeftRadius
     : edge === "bottom"
       ? style.borderTopLeftRadius
-      : style.borderTopRightRadius;
+      : edge === "right"
+        ? style.borderTopLeftRadius
+        : style.borderTopRightRadius;
   return Number.parseFloat(value) || 14;
 }
 
@@ -1147,10 +1169,10 @@ function setBodyPosition(body: HTMLElement, width: number, height: number) {
   const availableWidth = Math.max(0, window.innerWidth - width);
   const availableHeight = Math.max(0, window.innerHeight - height);
 
-  body.style.left = currentEdge === "left" ? "0px" : `${availableWidth * position}px`;
-  body.style.right = "auto";
-  body.style.top = currentEdge === "left" || currentEdge === "top"
-    ? `${currentEdge === "left" ? availableHeight * position : 0}px`
+  body.style.left = currentEdge === "left" ? "0px" : currentEdge === "right" ? "auto" : `${availableWidth * position}px`;
+  body.style.right = currentEdge === "right" ? "0px" : "auto";
+  body.style.top = isVerticalEdge(currentEdge) || currentEdge === "top"
+    ? `${isVerticalEdge(currentEdge) ? availableHeight * position : 0}px`
     : "auto";
   body.style.bottom = currentEdge === "bottom" ? "0px" : "auto";
   body.style.transform = "none";
@@ -1169,9 +1191,9 @@ function collapsedIslandSize(island = app.querySelector<HTMLElement>(".edge-isla
   if (island?.classList.contains("is-media-capsule")) {
     const length = Math.max(barLength, MEDIA_CAPSULE_LENGTH);
     const thickness = Math.max(barThickness, MEDIA_CAPSULE_THICKNESS);
-    return edge === "left" ? { width: thickness, height: length } : { width: length, height: thickness };
+    return isVerticalEdge() ? { width: thickness, height: length } : { width: length, height: thickness };
   }
-  return edge === "left"
+  return isVerticalEdge()
     ? { width: barThickness, height: barLength }
     : { width: barLength, height: barThickness };
 }
@@ -1196,7 +1218,7 @@ function positionCodexMediaBubble(body = app.querySelector<HTMLElement>(".island
   const bubble = island?.querySelector<HTMLElement>(".codex-media-bubble");
   if (!body || !bubble) return;
   const rect = body.getBoundingClientRect();
-  bubble.style.left = `${rect.right + 7}px`;
+  bubble.style.left = `${edge === "right" ? rect.left - 28 : rect.right + 7}px`;
   bubble.style.top = `${rect.top + rect.height / 2}px`;
 }
 
@@ -1219,8 +1241,8 @@ function publishNativeHitBounds(body: HTMLElement) {
   const bottom = Math.max(...rects.map((rect) => rect.bottom));
   const hostWidth = window.innerWidth;
   const hostHeight = window.innerHeight;
-  const hover = edge === "left"
-    ? { x: 0, y: (hostHeight - barLength) / 2, width: barThickness, height: barLength }
+  const hover = isVerticalEdge()
+    ? { x: edge === "right" ? hostWidth - barThickness : 0, y: (hostHeight - barLength) / 2, width: barThickness, height: barLength }
     : {
       x: (hostWidth - barLength) / 2,
       y: edge === "top" ? 0 : hostHeight - barThickness,
@@ -1300,7 +1322,13 @@ function freezeIslandGeometry(island: HTMLElement) {
 }
 
 function expandedIslandSize() {
-  const horizontal = edge !== "left";
+  if (onboardingLaunchGreetingActive) {
+    return {
+      width: Math.min(640, Math.max(220, window.innerWidth - 40)),
+      height: Math.min(150, Math.max(100, window.innerHeight - 32)),
+    };
+  }
+  const horizontal = !isVerticalEdge();
   const preferredWidth = activeTab === "home" && activeHomeView === "media" ? horizontal ? 1000 : 420
     : horizontal ? 960 : 420;
   const preferredHeight = onboardingOpen
@@ -1344,6 +1372,28 @@ function animateIsland(open: boolean) {
     motion.height.jump(target.height);
     motion.radius.jump(target.radius);
     setBodyGeometry(body, target.width, target.height, target.radius);
+    return;
+  }
+
+  if (open && onboardingLaunchGreetingActive) {
+    const startWidth = motion.width.value;
+    const startHeight = motion.height.value;
+    const startRadius = motion.radius.value;
+    const startedAt = now;
+    const frame = (frameNow: number) => {
+      if (token !== geometryFrame || motion.body !== body) return;
+      const progress = Math.min(1, Math.max(0, (frameNow - startedAt) / 500));
+      const growth = Math.sin(Math.PI * progress / 2) + 0.04 * Math.sin(Math.PI * progress) * progress;
+      const width = startWidth + (target.width - startWidth) * growth;
+      const height = startHeight + (target.height - startHeight) * growth;
+      const radius = startRadius + (target.radius - startRadius) * growth;
+      motion.width.jump(width);
+      motion.height.jump(height);
+      motion.radius.jump(radius);
+      setBodyGeometry(body, width, height, radius);
+      if (progress < 1) requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
     return;
   }
 
@@ -1468,6 +1518,10 @@ function renderPetCharacter(className = "") {
       <canvas class="pet-canvas" aria-hidden="true"></canvas>
       <span class="pet-activity-tooltip" role="status" aria-live="polite" aria-hidden="true"></span>
     </button>`;
+}
+
+function renderLaunchGreetingPet() {
+  return `<div class="pet launch-greeting-pet" data-skin="${petSkin}" data-accessory="${petAccessory}" data-mood="happy" role="img" aria-label="${escapeHtml(petName)}"><canvas class="pet-canvas" aria-hidden="true"></canvas></div>`;
 }
 
 function renderPocketItems(limit = 8) {
@@ -2788,15 +2842,12 @@ function renderOnboarding() {
   if (onboardingStep === "welcome") {
     return `
       <section class="onboarding-page onboarding-welcome">
-        <div class="onboarding-step-label">SEU NOVO COMPANHEIRO <span>1 DE 2</span></div>
+        <div class="onboarding-step-label"><span class="onboarding-step-title">PRIMEIROS PASSOS</span><span class="onboarding-step-progress" aria-label="Etapa 1 de 2"><i class="is-current"></i><i></i><small>01 / 02</small></span></div>
         <div class="onboarding-welcome-row">
           <div class="onboarding-hero" aria-hidden="true">
-            <div class="onboarding-orbit"></div>
-            <i class="onboarding-particle particle-a">✦</i><i class="onboarding-particle particle-b">✧</i><i class="onboarding-particle particle-c">·</i><i class="onboarding-particle particle-d">✦</i><i class="onboarding-particle particle-e">·</i><i class="onboarding-particle particle-f">✧</i>
             ${renderPetCharacter("onboarding-pet")}
-            <span class="onboarding-greeting-bubble">Oi! Prazer em te conhecer ✨</span>
           </div>
-          <div class="onboarding-welcome-copy"><span class="onboarding-welcome-kicker">UM CANTINHO SEU NA BORDA</span><h1>Oi! Eu sou o Ghosty.</h1><p>Vou ficar por perto para cuidar dos seus atalhos, acompanhar seu foco e guardar as coisinhas que você me confiar.</p></div>
+          <div class="onboarding-welcome-copy"><span class="onboarding-welcome-kicker">SEU NOVO COMPANHEIRO</span><h1>Oi! Eu sou o Ghosty.</h1><p>Cuido dos seus atalhos, acompanho seu foco e guardo o que você me confiar.</p></div>
         </div>
         <div class="onboarding-benefits">
           <div><span>HOME</span><p>Controle mídia e volume sem sair do que está fazendo.</p></div>
@@ -2818,7 +2869,7 @@ function renderOnboarding() {
     </label>`).join("");
   return `
     <section class="onboarding-page onboarding-choices">
-      <div class="onboarding-step-label"><button data-action="onboarding-back" aria-label="Voltar">←</button> CONFIGURAÇÃO RÁPIDA <span>2 DE 2</span></div>
+      <div class="onboarding-step-label"><button data-action="onboarding-back" aria-label="Voltar">←</button><span class="onboarding-step-title">CONFIGURAÇÃO RÁPIDA</span><span class="onboarding-step-progress" aria-label="Etapa 2 de 2"><i class="is-current"></i><i class="is-current"></i><small>02 / 02</small></span></div>
       <h1>Deixe tudo pronto</h1>
       <p class="onboarding-lead">Você pode mudar estas escolhas depois nas Configurações.</p>
       <div class="onboarding-mode-picker">
@@ -2844,6 +2895,7 @@ function renderOnboarding() {
 }
 
 function renderActiveTab() {
+  if (onboardingLaunchGreetingActive) return "";
   if (onboardingOpen) return renderOnboarding();
   if (activeTab === "pet") return renderPetPage();
   return renderHomePage();
@@ -2909,11 +2961,20 @@ function finishOnboarding(applyChoices: boolean) {
   localStorage.setItem(KEYS.onboardingComplete, "true");
   interactionMode = onboardingInteractionMode;
   localStorage.setItem(KEYS.interactionMode, interactionMode);
+  resetOnboardingLaunchTransition();
+  const replayRestore = launchGreetingReplayRestore;
+  if (replayRestore) {
+    edge = replayRestore.edge;
+    barPosition = replayRestore.barPosition;
+    onboardingIntroStarted = replayRestore.onboardingIntroStarted;
+    launchGreetingReplayRestore = null;
+  }
   onboardingOpen = false;
   onboardingStep = "welcome";
   activeTab = "home";
   render();
   setExpanded(false);
+  if (replayRestore) void applyDisplayLayout(false);
 }
 
 function openOnboarding() {
@@ -4287,7 +4348,7 @@ function renderSettingsContent() {
         ${renderShortcutsPage()}
       </div>`;
   }
-  const lengthLabel = edge === "left" ? "Altura da barrinha" : "Largura da barrinha";
+  const lengthLabel = isVerticalEdge() ? "Altura da barrinha" : "Largura da barrinha";
   return `
     <div class="settings-page">
       <div class="settings-scroll">
@@ -4331,6 +4392,7 @@ function renderSettingsContent() {
           <label class="setting-heading" for="edge-select">Borda da tela</label>
           <select id="edge-select" aria-label="Borda da tela">
             <option value="left" ${edge === "left" ? "selected" : ""}>Esquerda · vertical</option>
+            <option value="right" ${edge === "right" ? "selected" : ""}>Direita · vertical</option>
             <option value="top" ${edge === "top" ? "selected" : ""}>Em cima · horizontal</option>
             <option value="bottom" ${edge === "bottom" ? "selected" : ""}>Em baixo · horizontal</option>
           </select>
@@ -4396,6 +4458,11 @@ function renderSettingsContent() {
           <input id="sound-volume" type="range" min="0" max="100" value="${soundVolume}" ${soundEnabled ? "" : "disabled"} />
         </section>
         <p class="settings-note">As curvas do notch acompanham o comprimento e a orientação da barrinha.</p>
+        <section class="control-card setting-card">
+          <div class="setting-heading">Animação de entrada</div>
+          <p class="settings-note">Reproduza a introdução no topo da tela e abra o assistente de configuração ao terminar.</p>
+          <button class="reset-button" data-action=replay-onboarding-greeting type="button">Reproduzir animação de entrada</button>
+        </section>
         <button class="reset-button" data-action="reopen-onboarding">Abrir assistente de configuração</button>
         <button class="reset-button" data-action="reset-settings">Restaurar configurações padrão</button>
         </section>
@@ -4454,7 +4521,7 @@ function setExpanded(value: boolean) {
   island.classList.toggle("is-expanded", value);
   if (value) clearTaskCompletionToast(island);
   updateCodexApprovalPresentation();
-  if (value) {
+  if (value && !onboardingLaunchGreetingActive) {
     const pet = island.querySelector<HTMLElement>(".pet");
     const motion = pet ? petMotionEngines.get(pet) : undefined;
     if (motion) {
@@ -4473,6 +4540,7 @@ function setExpanded(value: boolean) {
 }
 
 function scheduleClose() {
+  if (onboardingOpen) return;
   if (hoverCloseTimer !== undefined) window.clearTimeout(hoverCloseTimer);
   hoverCloseTimer = window.setTimeout(() => {
     hoverCloseTimer = undefined;
@@ -4582,6 +4650,10 @@ function bindSettings() {
     if (currentWindowLabel === "settings-window") void invoke("open_onboarding").catch(() => undefined);
     else openOnboarding();
   });
+  app.querySelector<HTMLButtonElement>("[data-action=replay-onboarding-greeting]")?.addEventListener("click", () => {
+    if (currentWindowLabel === "settings-window") void invoke("replay_onboarding_greeting").catch(() => undefined);
+    else void replayOnboardingLaunchGreeting();
+  });
   bindRange("#bar-length", (value) => { barLength = value; }, "#bar-length-value", (value) => `${value} px`);
   bindRange("#bar-thickness", (value) => { barThickness = value; }, "#bar-thickness-value", (value) => `${value} px`);
   bindRange("#bar-position", (value) => { barPosition = value; }, "#bar-position-value", (value) => `${value}%`);
@@ -4632,12 +4704,138 @@ function bindCodexApprovalButtons(container: ParentNode) {
   });
 }
 
+function completeOnboardingLaunchGreeting() {
+  if (!onboardingLaunchGreetingActive) return;
+  launchGreetingRenderer?.stop();
+  launchGreetingRenderer = null;
+  launchGreetingStartedAt = null;
+  onboardingLaunchGreetingActive = false;
+  onboardingLaunchDocking = true;
+  onboardingLaunchDockOffset = null;
+  render();
+
+  const dockingStartedAt = performance.now();
+  const dockDuration = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 1 : 760;
+  const dockGhosty = (now: number) => {
+    if (!onboardingLaunchDocking) return;
+    const island = app.querySelector<HTMLElement>(".edge-island");
+    const body = island?.querySelector<HTMLElement>(".island-body");
+    const stage = island?.querySelector<HTMLElement>(".launch-greeting-stage");
+    const hero = island?.querySelector<HTMLElement>(".onboarding-hero");
+    if (!body || !stage || !hero) {
+      onboardingLaunchDocking = false;
+      render();
+      return;
+    }
+
+    // Track the destination every frame while the island expands. This keeps the
+    // dock motion attached to the hero even as the onboarding layout is still moving.
+    const progress = Math.min(1, Math.max(0, (now - dockingStartedAt) / dockDuration));
+    const eased = 1 - Math.pow(1 - progress, 3);
+    const bodyRect = body.getBoundingClientRect();
+    const heroRect = hero.getBoundingClientRect();
+    const targetX = heroRect.left + heroRect.width / 2 - (bodyRect.left + bodyRect.width / 2);
+    const targetY = heroRect.top + heroRect.height / 2 - (bodyRect.top + 75);
+    const x = targetX * eased;
+    const y = targetY * eased;
+    const scale = 1 - 0.3 * eased;
+    onboardingLaunchDockOffset = { x, y, scale };
+    stage.style.setProperty("--launch-dock-x", `${x}px`);
+    stage.style.setProperty("--launch-dock-y", `${y}px`);
+    stage.style.setProperty("--launch-dock-scale", String(scale));
+
+    if (progress < 1) {
+      window.requestAnimationFrame(dockGhosty);
+      return;
+    }
+
+    onboardingLaunchDockTimer = window.setTimeout(() => {
+      onboardingLaunchDockTimer = undefined;
+      if (!onboardingLaunchDocking) return;
+      onboardingLaunchDocking = false;
+      onboardingLaunchDockOffset = null;
+      onboardingWelcomeOptionsRevealing = true;
+      render();
+      onboardingWelcomeRevealTimer = window.setTimeout(() => {
+        onboardingWelcomeRevealTimer = undefined;
+        onboardingWelcomeOptionsRevealing = false;
+        app.querySelector<HTMLElement>(".edge-island")?.classList.remove("onboarding-options-revealing");
+      }, 680);
+    }, 40);
+  };
+  window.requestAnimationFrame(dockGhosty);
+}
+
+function resetOnboardingLaunchTransition() {
+  if (onboardingLaunchDockTimer !== undefined) window.clearTimeout(onboardingLaunchDockTimer);
+  if (onboardingWelcomeRevealTimer !== undefined) window.clearTimeout(onboardingWelcomeRevealTimer);
+  onboardingLaunchDockTimer = undefined;
+  onboardingWelcomeRevealTimer = undefined;
+  onboardingLaunchDocking = false;
+  onboardingWelcomeOptionsRevealing = false;
+  onboardingLaunchDockOffset = null;
+}
+
+async function replayOnboardingLaunchGreeting() {
+  if (currentWindowLabel !== "main" || onboardingLaunchGreetingActive || onboardingLaunchDocking || launchGreetingReplayRestore) return;
+  await mainStartupPromise?.catch(() => undefined);
+  if (onboardingLaunchGreetingActive || onboardingLaunchDocking || launchGreetingReplayRestore) return;
+
+  resetOnboardingLaunchTransition();
+  launchGreetingReplayRestore = { edge, barPosition, onboardingIntroStarted };
+  edge = "top";
+  barPosition = DEFAULTS.barPosition;
+  onboardingOpen = true;
+  onboardingStep = "welcome";
+  onboardingIntroStarted = true;
+  onboardingSelectedShortcutIds = new Set(shortcuts.slice(0, 3).map((shortcut) => shortcut.id));
+  onboardingInteractionMode = interactionMode;
+  activeTab = "home";
+  onboardingLaunchGreetingActive = true;
+  expanded = false;
+  render();
+
+  await applyDisplayLayout(false);
+  if (onboardingLaunchGreetingActive) startOnboardingLaunchGreeting();
+}
+
+function startOnboardingLaunchGreeting() {
+  if (!onboardingOpen || !onboardingLaunchGreetingActive) return;
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    onboardingLaunchGreetingActive = false;
+    render();
+    setExpanded(true);
+    return;
+  }
+
+  setExpanded(true);
+  const startedAt = performance.now();
+  launchGreetingStartedAt = startedAt;
+  const pet = app.querySelector<HTMLElement>(".launch-greeting-pet");
+  const motion = pet ? petMotionEngines.get(pet) : undefined;
+  motion?.welcome(startedAt, true);
+  const canvas = app.querySelector<HTMLCanvasElement>(".launch-greeting-effects");
+  if (!canvas) {
+    completeOnboardingLaunchGreeting();
+    return;
+  }
+  launchGreetingRenderer = new LaunchGreeting(canvas);
+  launchGreetingRenderer.start(startedAt, completeOnboardingLaunchGreeting);
+}
+
 function render() {
   if (currentWindowLabel === "settings-window") {
     renderSettingsWindow();
     return;
   }
   const previousIsland = app.querySelector<HTMLElement>(".edge-island");
+  const previousLaunchPet = previousIsland?.querySelector<HTMLElement>(".launch-greeting-pet");
+  if (previousLaunchPet) {
+    petMotionEngines.get(previousLaunchPet)?.dispose();
+    petMotionEngines.delete(previousLaunchPet);
+  }
+  launchGreetingRenderer?.stop();
+  launchGreetingRenderer = null;
   const previousBody = previousIsland?.querySelector<HTMLElement>(".island-body");
   const previousGeometry = previousBody
     && previousIsland?.dataset.edge === edge
@@ -4649,11 +4847,12 @@ function render() {
     }
     : null;
   app.innerHTML = `
-    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${shouldShowCollapsedMediaCapsule(previousIsland) ? "is-media-capsule" : ""} ${codexTaskRunning && mediaInfo.playing ? "is-codex-media-active" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
+    <section class="edge-island ${expanded ? "is-expanded" : ""} ${mediaInfo.playing && mediaInfo.artworkDataUrl ? "is-media-playing" : ""} ${shouldShowCollapsedMediaCapsule(previousIsland) ? "is-media-capsule" : ""} ${codexTaskRunning && mediaInfo.playing ? "is-codex-media-active" : ""} ${onboardingOpen ? "onboarding-open" : ""} ${onboardingLaunchGreetingActive ? "onboarding-launch-greeting" : ""} ${onboardingLaunchDocking ? "onboarding-launch-docking" : ""} ${onboardingWelcomeOptionsRevealing ? "onboarding-options-revealing" : ""} ${codexTaskRunning ? "is-task-running" : ""} ${pendingCodexApprovals.length > 0 ? "is-approval-pending" : ""}" aria-label="Edge Ghosty">
       <div class="island-body">
         <button class="peek-line" aria-label="${codexTaskRunning ? "Uma tarefa do Codex está em andamento. Abrir Edge Ghosty." : "Abrir Edge Ghosty"}"><span></span><span></span><span></span></button>
         <div class="media-peek" aria-hidden="true"><img alt="" draggable="false"${mediaInfo.artworkDataUrl ? ` src="${escapeHtml(mediaInfo.artworkDataUrl)}"` : ""}></div>
         <div class="media-peek-progress" aria-hidden="true" style="--media-progress:${mediaInfo.durationMs > 0 ? Math.min(1, currentMediaPosition() / mediaInfo.durationMs) * 100 : 0}%"><span></span></div>
+        ${onboardingLaunchGreetingActive || onboardingLaunchDocking ? `<div class="launch-greeting-stage pet-stage" aria-hidden="true" style="--launch-dock-x:${onboardingLaunchDockOffset?.x ?? 0}px;--launch-dock-y:${onboardingLaunchDockOffset?.y ?? 0}px;--launch-dock-scale:${onboardingLaunchDockOffset?.scale ?? 1}"><canvas class="launch-greeting-effects"></canvas>${renderLaunchGreetingPet()}</div>` : ""}
         <div class="island-content">
           <header class="menu-header">
             ${onboardingOpen ? '<div class="onboarding-brand">EDGE GHOSTY</div>' : `<nav class="menu-tabs" role="group" aria-label="Seções do Edge Ghosty">
@@ -4785,9 +4984,26 @@ function render() {
 
   const tabView = island.querySelector<HTMLElement>(".tab-view");
   if (tabView) bindTabContent(tabView);
+  if (onboardingLaunchGreetingActive || onboardingLaunchDocking) {
+    const pet = island.querySelector<HTMLElement>(".launch-greeting-pet");
+    if (pet) {
+      const motion = new PetMotionEngine(pet);
+      petMotionEngines.set(pet, motion);
+      if (launchGreetingStartedAt !== null) motion.welcome(launchGreetingStartedAt, true);
+    }
+    const canvas = island.querySelector<HTMLCanvasElement>(".launch-greeting-effects");
+    if (canvas && launchGreetingStartedAt !== null) {
+      launchGreetingRenderer = new LaunchGreeting(canvas);
+      launchGreetingRenderer.start(launchGreetingStartedAt, completeOnboardingLaunchGreeting);
+    }
+  }
   if (onboardingOpen && !onboardingIntroStarted) {
     onboardingIntroStarted = true;
     window.setTimeout(() => {
+      if (onboardingLaunchGreetingActive) {
+        startOnboardingLaunchGreeting();
+        return;
+      }
       const pet = app.querySelector<HTMLElement>(".onboarding-pet");
       if (!pet) return;
       petMotionEngines.get(pet)?.welcome();
@@ -5070,6 +5286,7 @@ void listen<QuickChatEvent>("edge-ghosty-quick-chat-event", ({ payload }) => {
 if (currentWindowLabel === "main") {
   void listen("edge-ghosty-quick-chat", () => { void openUtilityPopup("chat"); });
   void listen("edge-ghosty-open-onboarding", () => openOnboarding());
+  void listen("edge-ghosty-replay-onboarding-greeting", () => { void replayOnboardingLaunchGreeting(); });
   void listen<string>("edge-ghosty-tray-command", async ({ payload }) => {
     if (payload !== "open" && payload !== "settings") return;
     if (payload === "settings") {
@@ -5253,7 +5470,7 @@ window.addEventListener("storage", (event) => {
   else if (event.key === KEYS.shortcuts) updateActiveTab(activeTab);
   paintFocusTimer();
 });
-if (currentWindowLabel === "main") void startMainWindow();
+if (currentWindowLabel === "main") mainStartupPromise = startMainWindow();
 else if (currentWindowLabel === "utility-popup") startUtilityPopupWindow();
 else if (currentWindowLabel === "settings-window") void startSettingsWindow();
 else {

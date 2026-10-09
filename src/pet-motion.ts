@@ -2,7 +2,7 @@ type Skin = "pearl" | "smoke" | "midnight" | "mint" | "coral" | "lavender";
 type Accessory = "none" | "star" | "bow" | "halo" | "leaf" | "crown";
 export type PetState = "idle" | "working" | "thinking" | "searching" | "approval" | "question" | "error" | "finished" | "ratelimit" | "sleeping" | "dizzy";
 export type PetEmote = "love" | "surprised" | "proud" | "wink" | "yawn" | "happy" | "annoyed";
-type EyeShape = "pill" | "wide" | "dot" | "line" | "flat" | "happy" | "closed" | "spiral" | "heart" | "star" | "tired" | "wink" | "cup";
+type EyeShape = "pill" | "wide" | "dot" | "line" | "flat" | "happy" | "content" | "closed" | "spiral" | "heart" | "star" | "tired" | "wink" | "cup";
 type Channel = "squashX" | "squashY" | "lift" | "tilt" | "roll" | "offsetX" | "hands" | "eyeScale" | "morph" | "mouth" | "badgeScale";
 type Easing = "linear" | "in" | "out" | "inOut" | "back";
 type BadgeKind = "dots" | "bang" | "question" | "dot";
@@ -36,6 +36,12 @@ type GreetingPose = {
   handLeft: number;
   handRight: number;
   wave: number;
+  launch?: boolean;
+  bodyHeight?: number;
+  tint?: number;
+  halo?: number;
+  haloBlue?: number;
+  badge?: number;
 };
 
 type MotionStep = {
@@ -225,6 +231,7 @@ export class PetMotionEngine {
   private shortGreetingTilt = 0;
   private greetingBlinkAt: number[] = [];
   private greetingStartedAt = 0;
+  private greetingIsLaunch = false;
   private greetingExit: { startedAt: number; duration: number; pose: GreetingPose } | null = null;
   private activeEyeShape: EyeShape = "pill";
   private outgoingEyeShape: EyeShape = "pill";
@@ -297,6 +304,7 @@ export class PetMotionEngine {
   }
 
   setState(state: PetState, force = false, detail?: string) {
+    if (this.greetingIsLaunch && this.greetingStartedAt && performance.now() < this.greetingStartedAt + 4600) return;
     if (detail !== undefined) this.activityDetail = detail.trim();
     else if (this.activity !== state) this.activityDetail = "";
     if (state === "idle") this.activityDetail = "";
@@ -497,6 +505,7 @@ export class PetMotionEngine {
   }
 
   triggerEmote(emote: PetEmote, duration = 1800) {
+    if (this.greetingIsLaunch && this.greetingStartedAt && performance.now() < this.greetingStartedAt + 4600) return;
     this.interruptGreet();
     const now = performance.now();
     this.emote = emote;
@@ -575,9 +584,10 @@ export class PetMotionEngine {
     this.requestFrame();
   }
 
-  welcome() {
-    const now = performance.now();
+  welcome(startAt = performance.now(), launchGreeting = false) {
+    const now = startAt;
     this.greetingExit = null;
+    this.greetingIsLaunch = launchGreeting;
     this.shortGreetingStartedAt = 0;
     this.emote = null;
     this.emoteUntil = 0;
@@ -1194,15 +1204,20 @@ export class PetMotionEngine {
 
     ctx.save();
     const fileOffsetX = fileMotionActive ? this.fileBodyX : 0;
-    ctx.translate(viewWidth / 2 + this.value("offsetX") * 30 + fileOffsetX + (greeting?.x ?? 0), 51 + lift + (greeting?.y ?? 0));
+    if (greeting?.launch) this.drawGreetingHalo(ctx, greeting, viewWidth, lift);
+    ctx.translate(
+      viewWidth / 2 + this.value("offsetX") * 30 + fileOffsetX + (greeting?.x ?? 0),
+      (greeting?.launch ? 60 : 51) + lift + (greeting?.y ?? 0),
+    );
     ctx.rotate(tilt);
     ctx.scale(idleX * (1 + this.value("squashX") + chewX) * (greeting?.sx ?? 1) * (greeting?.scale ?? 1), idleY * (1 + this.value("squashY") + chewY) * (greeting?.sy ?? 1) * (greeting?.scale ?? 1));
-    this.drawHandStems(ctx, palette, now, greeting);
-    const body = this.drawBody(ctx, palette);
+    if (!greeting?.launch) this.drawHandStems(ctx, palette, now, greeting);
+    const body = this.drawBody(ctx, palette, greeting);
     this.drawMouth(ctx, body, this.value("morph"), mouth);
     this.drawFace(ctx, body, eyeOpen, now, activeEmote, greeting);
     this.drawHands(ctx, palette, now, greeting);
     this.drawAccessory(ctx, palette, now);
+    if (greeting?.launch) this.drawGreetingBadge(ctx, greeting);
     ctx.restore();
 
     this.drawParticles(ctx);
@@ -1215,7 +1230,7 @@ export class PetMotionEngine {
     return this.canvas.height ? (this.canvas.width / this.canvas.height) * 100 : 100;
   }
 
-  private greetingPose(now: number): GreetingPose | null {
+  private welcomePose(now: number): GreetingPose | null {
     if (!this.greetingStartedAt || this.reducedMotion.matches) return null;
     const t = (now - this.greetingStartedAt) / 1000;
     if (t < 0 || t >= 4.6) return null;
@@ -1287,8 +1302,144 @@ export class PetMotionEngine {
     return pose;
   }
 
+  /** Coucou's launch choreography, mapped into Ghosty's existing Canvas renderer. */
+  private launchGreetingPose(now: number): GreetingPose | null {
+    if (!this.greetingStartedAt || this.reducedMotion.matches) return null;
+    const t = (now - this.greetingStartedAt) / 1000;
+    if (t < 0) return null;
+    if (t >= 4.6) {
+      this.greetingStartedAt = 0;
+      this.greetingIsLaunch = false;
+      return null;
+    }
+
+    const segment = (start: number, end: number) => clamp((t - start) / (end - start), 0, 1);
+    const back = (value: number) => {
+      const amount = clamp(value, 0, 1);
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * (amount - 1) ** 3 + c1 * (amount - 1) ** 2;
+    };
+    const easeIn = (value: number) => clamp(value, 0, 1) ** 3;
+    const easeInOut = (value: number) => {
+      const amount = clamp(value, 0, 1);
+      return amount < 0.5 ? 4 * amount ** 3 : 1 - (-2 * amount + 2) ** 3 / 2;
+    };
+    const easeOut = (value: number) => 1 - (1 - clamp(value, 0, 1)) ** 3;
+    const mix = (from: number, to: number, amount: number) => from + (to - from) * amount;
+
+    const centerX = 320;
+    const centerY = 90;
+    const bodyHeight = t < 0.2 ? 0 : mix(58 * 0.15, 58, back(segment(0.2, 0.6)));
+    const landY = centerY + 0.12 * 58;
+    const peakY = centerY - 0.15 * 58;
+    const dipY = centerY + 0.36 * 58;
+    const springY = centerY - 0.1 * 58;
+    const sinkY = centerY + 0.3 * 58;
+    const drift1 = centerX - 0.16 * 58;
+    const drift2 = centerX - 0.45 * 58;
+    const drift3 = centerX - 0.57 * 58;
+    const drift4 = centerX - 0.85 * 58;
+
+    let x: number;
+    if (t < 0.85) x = centerX;
+    else if (t < 1.2) x = mix(centerX, drift1, easeInOut(segment(0.85, 1.2)));
+    else if (t < 1.3) x = mix(drift1, drift2, easeIn(segment(1.2, 1.3)));
+    else if (t < 1.45) x = mix(drift2, drift3, easeInOut(segment(1.3, 1.45)));
+    else if (t < 2.4) x = mix(drift3, drift4, easeInOut(segment(1.45, 2.4)));
+    else if (t < 2.85) x = drift4;
+    else x = mix(drift4, centerX, easeInOut(segment(2.85, 3.45)));
+
+    let y: number;
+    if (t < 0.2) y = 10;
+    else if (t < 0.6) y = mix(10, landY, easeIn(segment(0.2, 0.6)));
+    else if (t < 0.73) y = mix(landY, peakY, easeOut(segment(0.6, 0.73)));
+    else if (t < 0.9) y = mix(peakY, centerY, easeInOut(segment(0.73, 0.9)));
+    else if (t < 1.2) y = centerY;
+    else if (t < 1.3) y = mix(centerY, dipY, easeIn(segment(1.2, 1.3)));
+    else if (t < 1.45) y = mix(dipY, springY, easeOut(segment(1.3, 1.45)));
+    else if (t < 1.6) y = mix(springY, centerY, easeInOut(segment(1.45, 1.6)));
+    else if (t < 2.4) y = centerY;
+    else if (t < 2.7) y = mix(centerY, sinkY, easeInOut(segment(2.4, 2.7)));
+    else if (t < 2.85) y = sinkY;
+    else y = mix(sinkY, centerY, easeInOut(segment(2.85, 3.45)));
+
+    if (t >= 1.45 && t < 2.45) {
+      const waveTime = t - 1.45;
+      y += Math.sin(waveTime * 2 * Math.PI * 5) * 0.02 * 58 * clamp(waveTime / 0.08, 0, 1);
+    }
+
+    const landSquash = t >= 0.52 && t < 0.68 ? Math.sin(Math.PI * segment(0.52, 0.68)) : 0;
+    const bounce = t >= 0.62 && t < 0.84 ? Math.sin(Math.PI * segment(0.62, 0.84)) : 0;
+    let sx = 1 + 0.14 * landSquash - 0.1 * bounce;
+    let sy = 1 - 0.14 * landSquash + 0.18 * bounce;
+    const plunge = t >= 1.18 && t < 1.42 ? Math.sin(Math.PI * segment(1.18, 1.42)) : 0;
+    const spring = t >= 1.3 && t < 1.46 ? Math.sin(Math.PI * segment(1.3, 1.46)) : 0;
+    sx += 0.12 * plunge - 0.18 * spring;
+    sy -= 0.12 * plunge - 0.25 * spring;
+    let sink = 0;
+    if (t >= 2.38 && t < 2.7) sink = easeInOut(segment(2.38, 2.7));
+    else if (t >= 2.7 && t < 2.85) sink = 1 - easeInOut(segment(2.7, 2.85));
+    sx += 0.18 * sink;
+    sy -= 0.14 * sink;
+    const micro = t >= 3.7 && t < 3.82 ? Math.sin(Math.PI * segment(3.7, 3.82)) : 0;
+    sx += 0.08 * micro;
+    sy -= 0.07 * micro;
+
+    let eye: EyeShape = "dot";
+    if (t >= 0.55 && t < 0.8) eye = "happy";
+    if (t >= 2.4 && t < 2.7) eye = "content";
+    const blink = (start: number) => {
+      const phase = segment(start, start + 0.12);
+      return phase > 0 && phase < 1 ? 1 - Math.sin(Math.PI * phase) * 0.94 : 1;
+    };
+    const open = Math.min(blink(1.95), blink(3.05), blink(3.7));
+
+    let lookX = 0;
+    let lookY = 0;
+    if (t >= 1.45 && t < 2.4) { lookX = 0.55; lookY = -0.45; }
+    else if (t >= 2.4 && t < 2.85) { lookX = -0.3; lookY = 0.6; }
+    else if (t >= 2.85 && t < 3.45) { lookX = 0.3; lookY = 0.6; }
+    else if (t >= 3.45) {
+      const settle = easeInOut(segment(3.45, 3.8));
+      lookX = 0.3 * (1 - settle);
+      lookY = 0.6 * (1 - settle);
+    }
+
+    const handLeft = t < 2.45
+      ? back(segment(1.3, 1.44))
+      : 1 - easeIn(segment(2.45, 2.67));
+    const handRight = t < 2.45
+      ? back(segment(1.34, 1.48))
+      : 1 - easeIn(segment(2.48, 2.7));
+    const wave = t >= 1.45 && t < 2.45 ? t - 1.45 : -1;
+
+    return {
+      launch: true,
+      bodyHeight,
+      scale: bodyHeight / 120,
+      x: (x - centerX) * (2 / 3),
+      y: (y - centerY) * (2 / 3),
+      sx,
+      sy,
+      tilt: 0,
+      eye,
+      eyeRoll: 0,
+      open,
+      lookX,
+      lookY,
+      handLeft,
+      handRight,
+      wave,
+      tint: 0.6 * easeInOut(segment(3.85, 4.15)),
+      halo: easeOut(segment(0.3, 0.7)),
+      haloBlue: segment(3.85, 4.15),
+      badge: back(segment(2.72, 3.0)),
+    };
+  }
+
   private currentGreetingPose(now: number): GreetingPose | null {
-    if (this.greetingStartedAt) return this.greetingPose(now);
+    if (this.greetingStartedAt) return this.greetingIsLaunch ? this.launchGreetingPose(now) : this.welcomePose(now);
     const exit = this.greetingExit;
     if (!exit) return null;
     const progress = clamp((now - exit.startedAt) / exit.duration, 0, 1);
@@ -1313,6 +1464,12 @@ export class PetMotionEngine {
       handLeft: lerp(pose.handLeft, 0, amount),
       handRight: lerp(pose.handRight, 0, amount),
       wave: -1,
+      launch: pose.launch,
+      bodyHeight: lerp(pose.bodyHeight ?? 0, 0, amount),
+      tint: lerp(pose.tint ?? 0, 0, amount),
+      halo: lerp(pose.halo ?? 0, 0, amount),
+      haloBlue: lerp(pose.haloBlue ?? 0, 1, amount),
+      badge: lerp(pose.badge ?? 0, 0, amount),
     };
   }
 
@@ -1323,14 +1480,14 @@ export class PetMotionEngine {
     const longWaveTime = greeting?.wave ?? -1;
     const longWave = longWaveTime >= 0;
     const shortWave = !greeting && !this.reducedMotion.matches && now >= this.waveStartedAt && now < this.waveUntil && this.waveStartedAt > 0;
-    const waving = side > 0 && (longWave || shortWave);
+    const waving = greeting?.launch ? side < 0 && longWave : side > 0 && (longWave || shortWave);
     const waveTime = longWave ? longWaveTime : shortWave ? (now - this.waveStartedAt) / 1000 : 0;
     const waveX = waving
       ? longWave ? Math.cos(waveTime * Math.PI * 5) * 0.9 : Math.cos(waveTime * 13) * 2.1 * easing(clamp(waveTime / 0.18, 0, 1), "out")
       : 0;
     const waveY = waving
       ? longWave ? Math.sin(waveTime * Math.PI * 5 + 0.8) * 1.6 : -14 * easing(clamp(waveTime / 0.18, 0, 1), "out") + Math.sin(waveTime * 13) * 3.2 * easing(clamp(waveTime / 0.18, 0, 1), "out")
-      : longWave && side < 0
+      : longWave && (greeting?.launch ? side > 0 : side < 0)
         ? Math.sin(longWaveTime * 6) * 1.4
         : 0;
     return {
@@ -1363,7 +1520,57 @@ export class PetMotionEngine {
     }
   }
 
-  private drawBody(ctx: CanvasRenderingContext2D, palette: Palette) {
+  private drawGreetingHalo(ctx: CanvasRenderingContext2D, greeting: GreetingPose, viewWidth: number, lift: number) {
+    const bodyHeight = greeting.bodyHeight ?? 0;
+    if (bodyHeight <= 0 || !greeting.halo) return;
+    const blue = greeting.haloBlue ?? 0;
+    const red = Math.round(lerp(232, 59, blue));
+    const green = Math.round(lerp(195, 158, blue));
+    const blueChannel = Math.round(lerp(154, 255, blue));
+    const centerX = viewWidth / 2 + greeting.x;
+    const centerY = 60 + lift + greeting.y;
+    const halfWidth = bodyHeight * 0.67;
+    for (const [radiusMultiplier, opacity] of [[2.6, 0.18], [4.2, 0.07]] as const) {
+      const radius = halfWidth * radiusMultiplier * (2 / 3);
+      const gradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+      gradient.addColorStop(0, `rgba(${red},${green},${blueChannel},${opacity * greeting.halo})`);
+      gradient.addColorStop(1, `rgba(${red},${green},${blueChannel},0)`);
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  private drawGreetingBadge(ctx: CanvasRenderingContext2D, greeting: GreetingPose) {
+    const bodyHeight = greeting.bodyHeight ?? 0;
+    const scale = clamp(greeting.badge ?? 0, 0, 1);
+    if (bodyHeight <= 0 || scale <= 0.01) return;
+    const coordinateScale = 80 / bodyHeight;
+    const halfHeight = bodyHeight / 2 * coordinateScale;
+    const halfWidth = bodyHeight * 0.67 * coordinateScale;
+    const radius = halfHeight * 0.3;
+    ctx.save();
+    ctx.translate(-halfWidth * 0.78, -halfHeight * 0.72);
+    ctx.scale(scale, scale);
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.arc(0, 0, radius + halfHeight * 0.07, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#3BA0F5";
+    ctx.beginPath();
+    ctx.arc(0, 0, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#0B1B3A";
+    for (const position of [-1, 0, 1]) {
+      ctx.beginPath();
+      ctx.arc(position * radius * 0.5, 0, radius * 0.17, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  private drawBody(ctx: CanvasRenderingContext2D, palette: Palette, greeting: GreetingPose | null = null) {
     const path = new Path2D();
     const morph = clamp(this.value("morph"), 0, 1);
     const steps = 72;
@@ -1402,6 +1609,14 @@ export class PetMotionEngine {
       const tint = ctx.createLinearGradient(0, -40, 0, 40);
       tint.addColorStop(0, rgba(this.stateColor, 0));
       tint.addColorStop(1, rgba(this.stateColor, tintAmount));
+      ctx.fillStyle = tint;
+      ctx.fill(path);
+    }
+
+    if (greeting?.launch && (greeting.tint ?? 0) > 0) {
+      const tint = ctx.createLinearGradient(0, 40, 0, -4);
+      tint.addColorStop(0, `rgba(127,180,234,${greeting.tint})`);
+      tint.addColorStop(1, "rgba(127,180,234,0)");
       ctx.fillStyle = tint;
       ctx.fill(path);
     }
@@ -1480,7 +1695,7 @@ export class PetMotionEngine {
     const eyeLayers = this.eyeShapeLayers(eyeMode, now);
     const eyeScale = Math.max(0.75, 1 + this.value("eyeScale"));
     const eyeHeight = radius * 1.07 * eyeScale;
-    const eyeWidth = radius * 0.45 * eyeScale;
+    const eyeWidth = radius * (greeting?.launch ? 0.27 : 0.45) * eyeScale;
 
     ctx.save();
     ctx.clip(body);
@@ -1578,6 +1793,14 @@ export class PetMotionEngine {
         break;
       case "happy":
         this.drawEyeArc(ctx, width, height, false);
+        break;
+      case "content":
+        ctx.beginPath();
+        ctx.arc(0, -height * 0.16, width * 0.82, Math.PI * 0.15, Math.PI * 0.85);
+        ctx.strokeStyle = ink;
+        ctx.lineWidth = width * 0.5;
+        ctx.lineCap = "round";
+        ctx.stroke();
         break;
       case "closed":
         this.drawEyeArc(ctx, width, height, true);
@@ -1702,6 +1925,10 @@ export class PetMotionEngine {
   }
 
   private drawHands(ctx: CanvasRenderingContext2D, palette: Palette, now: number, greeting: GreetingPose | null) {
+    if (greeting?.launch) {
+      this.drawLaunchGreetingHands(ctx, palette, greeting);
+      return;
+    }
     for (const side of [-1, 1]) {
       const gesture = greeting ? side < 0 ? greeting.handLeft : greeting.handRight : this.value("hands");
       if (gesture < 0.01) continue;
@@ -1726,6 +1953,75 @@ export class PetMotionEngine {
       ctx.stroke();
       ctx.restore();
     }
+  }
+
+  private drawLaunchGreetingHands(ctx: CanvasRenderingContext2D, palette: Palette, greeting: GreetingPose) {
+    const bodyHeight = greeting.bodyHeight ?? 0;
+    if (bodyHeight <= 0) return;
+    const coordinateScale = 80 / bodyHeight;
+    const halfHeight = bodyHeight / 2 * coordinateScale;
+    const halfWidth = bodyHeight * 0.67 * coordinateScale;
+    const wave = greeting.wave;
+    const waveActive = wave >= 0;
+
+    const leftProgress = clamp(greeting.handLeft, 0, 1);
+    if (leftProgress > 0.01) {
+      const x = lerp(-halfWidth * 0.35, -halfWidth - bodyHeight * 0.22 * coordinateScale, leftProgress);
+      let y = lerp(halfHeight * 0.85, halfHeight * 0.62, leftProgress);
+      if (waveActive) {
+        const rampIn = clamp(wave / 0.08, 0, 1);
+        const rampOut = 1 - clamp((wave - (2.45 - 1.45)) / (2.7 - 2.45), 0, 1);
+        y += Math.sin(wave * 2 * Math.PI * 5) * bodyHeight * 0.14 * coordinateScale * rampIn * rampOut;
+      }
+      const radius = bodyHeight * 0.15 * coordinateScale * leftProgress;
+      ctx.save();
+      ctx.globalAlpha = leftProgress;
+      ctx.translate(x, y);
+      const hand = ctx.createLinearGradient(0, -radius, 0, radius);
+      hand.addColorStop(0, palette.top);
+      hand.addColorStop(1, palette.middle);
+      ctx.fillStyle = hand;
+      ctx.strokeStyle = palette.edge;
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, radius, radius, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const rightProgress = clamp(greeting.handRight, 0, 1);
+    if (rightProgress <= 0.01) return;
+    const x = lerp(halfWidth * 0.35, halfWidth + bodyHeight * 0.2 * coordinateScale, rightProgress);
+    const y = lerp(halfHeight * 0.85, halfHeight * 0.2, rightProgress);
+    const width = bodyHeight * 0.4 * coordinateScale * rightProgress;
+    const height = bodyHeight * 0.22 * coordinateScale * rightProgress;
+    const angle = waveActive ? -0.61 + Math.sin(wave * 2 * Math.PI * 2.5) * 0.04 : -0.61;
+    ctx.save();
+    ctx.globalAlpha = rightProgress;
+    ctx.translate(x, y);
+    ctx.rotate(angle);
+    const radius = Math.min(width / 2, height / 2);
+    ctx.beginPath();
+    ctx.moveTo(-width / 2 + radius, -height / 2);
+    ctx.lineTo(width / 2 - radius, -height / 2);
+    ctx.arcTo(width / 2, -height / 2, width / 2, -height / 2 + radius, radius);
+    ctx.lineTo(width / 2, height / 2 - radius);
+    ctx.arcTo(width / 2, height / 2, width / 2 - radius, height / 2, radius);
+    ctx.lineTo(-width / 2 + radius, height / 2);
+    ctx.arcTo(-width / 2, height / 2, -width / 2, height / 2 - radius, radius);
+    ctx.lineTo(-width / 2, -height / 2 + radius);
+    ctx.arcTo(-width / 2, -height / 2, -width / 2 + radius, -height / 2, radius);
+    ctx.closePath();
+    const hand = ctx.createLinearGradient(width / 2, -height / 2, -width / 2, height / 2);
+    hand.addColorStop(0, palette.top);
+    hand.addColorStop(1, palette.middle);
+    ctx.fillStyle = hand;
+    ctx.strokeStyle = palette.edge;
+    ctx.lineWidth = 1.1;
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
   }
 
   private drawParticles(ctx: CanvasRenderingContext2D) {

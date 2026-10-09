@@ -143,6 +143,7 @@ const CURSOR_HIT_MARGIN: f64 = 14.0;
 #[derive(Clone, Copy)]
 enum Edge {
     Left,
+    Right,
     Top,
     Bottom,
 }
@@ -151,6 +152,7 @@ impl Edge {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "left" => Ok(Self::Left),
+            "right" => Ok(Self::Right),
             "top" => Ok(Self::Top),
             "bottom" => Ok(Self::Bottom),
             _ => Err(format!("borda desconhecida: {value}")),
@@ -809,7 +811,7 @@ fn window_geometry(edge: Edge, monitor: &Monitor, position_percent: f64) -> (Phy
     let monitor_position = monitor.position();
     let monitor_size = monitor.size();
     let logical_size = match edge {
-        Edge::Left => (
+        Edge::Left | Edge::Right => (
             900.min((f64::from(monitor_size.width) / scale) as u32),
             720.min((f64::from(monitor_size.height) / scale) as u32),
         ),
@@ -828,10 +830,11 @@ fn window_geometry(edge: Edge, monitor: &Monitor, position_percent: f64) -> (Phy
     let along = |remaining: u32| (f64::from(remaining) * position).round() as u32;
     let x = match edge {
         Edge::Left => monitor_position.x,
+        Edge::Right => monitor_position.x + remaining_x as i32,
         Edge::Top | Edge::Bottom => monitor_position.x + along(remaining_x) as i32,
     };
     let y = match edge {
-        Edge::Left => monitor_position.y + along(remaining_y) as i32,
+        Edge::Left | Edge::Right => monitor_position.y + along(remaining_y) as i32,
         Edge::Top => monitor_position.y,
         Edge::Bottom => monitor_position.y + remaining_y as i32,
     };
@@ -856,6 +859,12 @@ fn collapsed_island_rect(
     match edge {
         Edge::Left => IslandRect {
             x: 0.0,
+            y: (host_height - length).max(0.0) * position,
+            width: thickness,
+            height: length,
+        },
+        Edge::Right => IslandRect {
+            x: host_width - thickness,
             y: (host_height - length).max(0.0) * position,
             width: thickness,
             height: length,
@@ -928,6 +937,17 @@ fn open_onboarding(app: AppHandle) -> Result<(), String> {
     main.show().map_err(|error| error.to_string())?;
     main.set_focus().map_err(|error| error.to_string())?;
     app.emit_to("main", "edge-ghosty-open-onboarding", ())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn replay_onboarding_greeting(app: AppHandle) -> Result<(), String> {
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "janela principal não encontrada".to_string())?;
+    main.show().map_err(|error| error.to_string())?;
+    main.set_focus().map_err(|error| error.to_string())?;
+    app.emit_to("main", "edge-ghosty-replay-onboarding-greeting", ())
         .map_err(|error| error.to_string())
 }
 
@@ -1100,6 +1120,7 @@ async fn apply_display_layout(
         LayoutUpdate {
             edge: match edge {
                 Edge::Left => "left",
+                Edge::Right => "right",
                 Edge::Top => "top",
                 Edge::Bottom => "bottom",
             }
@@ -1142,7 +1163,7 @@ pub fn run() {
                 if let Some(monitor) = window.primary_monitor()? {
                     window.set_ignore_cursor_events(true)?;
                     window.set_always_on_top(true)?;
-                    place_window(&window, Edge::Left, &monitor, 50.0).map_err(std::io::Error::other)?;
+                    place_window(&window, Edge::Top, &monitor, 50.0).map_err(std::io::Error::other)?;
                 }
                 window.set_skip_taskbar(true)?;
             }
@@ -1181,6 +1202,7 @@ pub fn run() {
             show_quick_chat,
             show_settings_window,
             open_onboarding,
+            replay_onboarding_greeting,
             codex_chat::quick_chat_start,
             codex_chat::quick_chat_status,
             codex_chat::quick_chat_login,
